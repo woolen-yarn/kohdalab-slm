@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Locate Windows resource compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter rc.exe |
+            Where-Object { $_.FullName -match '\\x64\\rc.exe$' } |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $rc) { throw 'Windows resource compiler rc.exe was not found.' }
+          "RC=$($rc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Test workspace
+        run: cargo test --locked --workspace

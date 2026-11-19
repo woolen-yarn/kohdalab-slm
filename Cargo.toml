@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/slm-core", "crates/slm-device", "crates/slm-desktop"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = "3"
+slm-core = { path = "crates/slm-core" }
+slm-device = { path = "crates/slm-device" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+overflow-checks = true
+
+# Pattern generation runs 2.3 Mpx loops; keep debug/test builds usable.
+[profile.dev.package.slm-core]
+opt-level = 2

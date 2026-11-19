@@ -1,0 +1,25 @@
+[package]
+name = "kohdalab-slm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "kohdalab-slm"
+build = "build.rs"
+
+[[bin]]
+name = "kohdalab-slm"
+path = "src/main.rs"
+
+[dependencies]
+slm-core.workspace = true
+slm-device.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+image.workspace = true
+eframe = { version = "^0.34.3", default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "accesskit"] }
+rfd = { version = "0.17.2", default-features = false }
+
+[dev-dependencies]
+egui_kittest = { version = "=0.34.0", default-features = false, features = ["eframe"] }
