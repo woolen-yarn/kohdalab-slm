@@ -339,9 +339,10 @@ impl<'a> Form<'a> {
             let focused = ui.memory(|m| m.has_focus(id));
             let mut text = if focused {
                 ui.data(|d| d.get_temp::<String>(id))
-                    .unwrap_or_else(|| slm_core::units::format_number(*value))
+                    .unwrap_or_else(|| value.to_string())
             } else {
-                slm_core::units::format_number(*value)
+                let full = slm_core::units::format_number(*value);
+                if full.len() > 8 { format!("{:.4e}", *value) } else { full }
             };
             let response = ui.put(
                 r,
@@ -353,7 +354,7 @@ impl<'a> Form<'a> {
                     .desired_width(r.width()),
             );
             let parsed = text.trim().parse::<f64>().ok().filter(|v| v.is_finite());
-            if response.has_focus() && parsed.is_none() && !text.trim().is_empty() {
+            if response.has_focus() && parsed.is_none() {
                 ui.painter().rect_stroke(
                     r,
                     6.,
@@ -361,6 +362,11 @@ impl<'a> Form<'a> {
                     egui::StrokeKind::Inside,
                 );
             }
+            let response = if parsed.is_none() {
+                response.on_hover_text("Enter a finite number. The last valid value is retained; empty text is not applied.")
+            } else { response.on_hover_text(format!("Full value: {value}")) };
+            // Keep full precision on focus; compact display is never parsed into the model without an edit.
+            if response.gained_focus() && !response.changed() { text = value.to_string(); }
             ui.data_mut(|d| d.insert_temp(id, text));
             match parsed {
                 Some(v) if response.changed() && v != *value => {

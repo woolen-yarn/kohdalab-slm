@@ -1,7 +1,8 @@
 //! Input Pattern preview: renders the current input with the same core code
 //! that produces the sent frame (`PatternSpec::render`,
-//! `experiment::render_item`) and shows it with the preview-only grayscale
-//! map below (PNG export keeps `heatmap::code_rgb`).
+//! `experiment::render_item`) and colors it with the selected
+//! `heatmap::Colormap` over the fixed scale 0 … max code (the same colors a
+//! saved code PNG gets). The colormap never changes the codes or the digest.
 //!
 //! It runs on its own thread and never touches the device worker. Requests
 //! carry a key derived from the full input; only the newest request is
@@ -9,7 +10,8 @@
 //! input, so an edit or a tab switch never shows a stale pattern.
 
 use slm_core::experiment::{ExperimentItem, ItemSource, render_item};
-use slm_core::{CodeFrame, GenerationProfile, PatternSpec, PeriodUnit};
+use slm_core::heatmap::Colormap;
+use slm_core::{GenerationProfile, PatternSpec, PeriodUnit};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -27,7 +29,12 @@ pub enum PreviewSource {
 }
 
 impl PreviewSource {
-    pub fn save_to(&self, path: &std::path::Path, png: bool) -> Result<(), String> {
+    pub fn save_to(
+        &self,
+        path: &std::path::Path,
+        png: bool,
+        colormap: Colormap,
+    ) -> Result<(), String> {
         let (rendered, max_code) = self.rendered()?;
         if !png {
             let csv = slm_core::csv::write_santec_csv(rendered.code());
@@ -42,6 +49,7 @@ impl PreviewSource {
             &rendered,
             slm_core::heatmap::HeatmapKind::Code,
             max_code,
+            colormap,
             staged.path(),
         )?;
         staged.persist(path).map_err(|e| e.error.to_string())?;
@@ -78,19 +86,10 @@ pub struct PreviewImage {
     pub max_code_used: u16,
     /// Color scale upper bound (device max code, Santec 1023).
     pub scale_max: u16,
+    /// Colors of `rgb`, over the fixed scale 0 … `scale_max`.
+    pub colormap: Colormap,
     /// Coordinate system of the source pattern (see [`PreviewAxes`]).
     pub axes: PreviewAxes,
-}
-
-/// Preview-only grayscale: code 0 is black, the device max code is white,
-/// linear and fixed in between (independent of the codes in use).
-pub fn gray(code: u16, max_code: u16) -> [u8; 3] {
-    let level = (f64::from(code.min(max_code)) * 255. / f64::from(max_code.max(1))).round() as u8;
-    [level; 3]
-}
-
-pub fn gray_rgb(frame: &CodeFrame, max_code: u16) -> Vec<u8> {
-    frame.data.iter().flat_map(|&c| gray(c, max_code)).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,18 +254,21 @@ pub struct PreviewResult {
     pub result: Result<PreviewImage, String>,
 }
 
+type Request = (String, PreviewSource, Colormap);
+
 pub struct Previewer {
-    requests: Sender<(String, PreviewSource)>,
+    requests: Sender<Request>,
     results: Receiver<PreviewResult>,
 }
 
-pub fn render(source: &PreviewSource) -> Result<PreviewImage, String> {
+pub fn render(source: &PreviewSource, colormap: Colormap) -> Result<PreviewImage, String> {
     let (rendered, scale_max) = source.rendered()?;
     let code = rendered.code();
     Ok(PreviewImage {
         width: code.width,
         height: code.height,
-        rgb: gray_rgb(code, scale_max),
+        rgb: slm_core::heatmap::code_rgb(code, scale_max, colormap),
+        colormap,
         axes: PreviewAxes::for_source(source),
         digest: code.digest(),
         min_code: code.data.iter().copied().min().unwrap_or(0),
@@ -277,7 +279,7 @@ pub fn render(source: &PreviewSource) -> Result<PreviewImage, String> {
 
 impl Previewer {
     pub fn spawn(notify: Box<dyn Fn() + Send>) -> Self {
-        let (requests, request_rx) = channel::<(String, PreviewSource)>();
+        let (requests, request_rx) = channel::<Request>();
         let (result_tx, results) = channel();
         std::thread::Builder::new()
             .name("slm-preview".into())
@@ -287,8 +289,8 @@ impl Previewer {
                     while let Ok(newer) = request_rx.try_recv() {
                         next = newer;
                     }
-                    let (key, source) = next;
-                    let result = render(&source);
+                    let (key, source, colormap) = next;
+                    let result = render(&source, colormap);
                     if result_tx.send(PreviewResult { key, result }).is_err() {
                         return;
                     }
@@ -299,8 +301,8 @@ impl Previewer {
         Self { requests, results }
     }
 
-    pub fn request(&self, key: String, source: PreviewSource) {
-        let _ = self.requests.send((key, source));
+    pub fn request(&self, key: String, source: PreviewSource, colormap: Colormap) {
+        let _ = self.requests.send((key, source, colormap));
     }
 
     pub fn try_results(&self) -> Vec<PreviewResult> {
@@ -311,6 +313,7 @@ impl Previewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slm_core::CodeFrame;
     use slm_device::DeviceProfile;
 
     #[test]
@@ -326,7 +329,7 @@ mod tests {
         };
         assert_ne!(a.key(), b.key());
         assert_eq!(a.key(), a.clone().key());
-        let image = render(&a).unwrap();
+        let image = render(&a, Colormap::Grayscale).unwrap();
         let sent = PatternSpec::Uniform { code: 512 }.render(&profile).unwrap();
         assert_eq!(image.digest, sent.code().digest());
         assert_eq!((image.width, image.height), (1920, 1200));
@@ -353,8 +356,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let csv = dir.path().join("pattern.csv");
         let png = dir.path().join("pattern.png");
-        source.save_to(&csv, false).unwrap();
-        source.save_to(&png, true).unwrap();
+        source.save_to(&csv, false, Colormap::Viridis).unwrap();
+        source.save_to(&png, true, Colormap::Viridis).unwrap();
         let saved = slm_core::csv::read_santec_csv(
             &std::fs::read_to_string(csv).unwrap(),
             8,
@@ -368,7 +371,7 @@ mod tests {
         assert_eq!(image.dimensions(), (8, 4));
         assert_eq!(
             image.into_raw(),
-            slm_core::heatmap::code_rgb(&saved, profile.max_code)
+            slm_core::heatmap::code_rgb(&saved, profile.max_code, Colormap::Viridis)
         );
     }
 
@@ -444,15 +447,21 @@ mod tests {
                 rotation: AngleValue::degrees(0.),
             },
         };
-        let a = render(&PreviewSource::Spec {
-            spec: at([-16, 110]),
-            profile,
-        })
+        let a = render(
+            &PreviewSource::Spec {
+                spec: at([-16, 110]),
+                profile,
+            },
+            Colormap::Grayscale,
+        )
         .unwrap();
-        let b = render(&PreviewSource::Spec {
-            spec: at([40, -25]),
-            profile,
-        })
+        let b = render(
+            &PreviewSource::Spec {
+                spec: at([40, -25]),
+                profile,
+            },
+            Colormap::Grayscale,
+        )
         .unwrap();
         assert_ne!(a.digest, b.digest, "Center X/Y still drives generation");
         assert_eq!(a.axes, b.axes, "but the display origin stays put");
@@ -468,10 +477,13 @@ mod tests {
     #[test]
     fn unit_follows_period_entry_with_the_same_origin() {
         let profile = DeviceProfile::santec_slm200_candidate().generation;
-        let px = render(&PreviewSource::Spec {
-            spec: single(PeriodValue::px(75.), 0.),
-            profile,
-        })
+        let px = render(
+            &PreviewSource::Spec {
+                spec: single(PeriodValue::px(75.), 0.),
+                profile,
+            },
+            Colormap::Grayscale,
+        )
         .unwrap();
         // 75 px × 8 µm / 75 = 8 µm: the same physical period entered in µm.
         let um_spec = single(um(8.), 0.);
@@ -575,23 +587,59 @@ mod tests {
         assert_eq!(tick_label(0.25, 0.05), "0.25");
     }
 
+    fn code_colors(data: Vec<u16>, map: Colormap) -> Vec<u8> {
+        let frame = CodeFrame {
+            width: data.len() as u32,
+            height: 1,
+            data,
+        };
+        slm_core::heatmap::code_rgb(&frame, 1023, map)
+    }
+
     #[test]
     fn grayscale_is_black_to_white_linear_and_fixed() {
-        assert_eq!(gray(0, 1023), [0, 0, 0]);
-        assert_eq!(gray(1023, 1023), [255, 255, 255]);
-        assert_eq!(gray(512, 1023), [128, 128, 128]);
-        assert_eq!(gray(256, 1023), [64, 64, 64]);
+        let gray = |code: u16| code_colors(vec![code], Colormap::Grayscale);
+        assert_eq!(gray(0), [0, 0, 0]);
+        assert_eq!(gray(1023), [255, 255, 255]);
+        assert_eq!(gray(512), [128, 128, 128]);
+        assert_eq!(gray(256), [64, 64, 64]);
         // Fixed to the device max, not to the codes in use; out of range clamps.
-        assert_eq!(gray(887, 1023), [221, 221, 221]);
-        assert_eq!(gray(2000, 1023), [255, 255, 255]);
-        let frame = CodeFrame {
-            width: 3,
-            height: 1,
-            data: vec![0, 512, 1023],
-        };
+        assert_eq!(gray(887), [221, 221, 221]);
+        assert_eq!(gray(2000), [255, 255, 255]);
         assert_eq!(
-            gray_rgb(&frame, 1023),
+            code_colors(vec![0, 512, 1023], Colormap::Grayscale),
             vec![0, 0, 0, 128, 128, 128, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn colormap_changes_colors_but_not_codes_or_digest() {
+        let profile = DeviceProfile::santec_slm200_candidate().generation;
+        let source = PreviewSource::Spec {
+            spec: single(PeriodValue::px(100.), 30.),
+            profile,
+        };
+        let images: Vec<PreviewImage> = Colormap::ALL
+            .into_iter()
+            .map(|map| render(&source, map).unwrap())
+            .collect();
+        let sent = single(PeriodValue::px(100.), 30.).render(&profile).unwrap();
+        for (image, map) in images.iter().zip(Colormap::ALL) {
+            assert_eq!(image.colormap, map);
+            assert_eq!(image.digest, sent.code().digest());
+            assert_eq!(image.scale_max, 1023);
+            assert_eq!(
+                image.rgb,
+                slm_core::heatmap::code_rgb(sent.code(), 1023, map)
+            );
+        }
+        assert_ne!(images[0].rgb, images[1].rgb);
+        assert_ne!(images[1].rgb, images[2].rgb);
+        // Fixed 0 … max scale: the extremes map to the colormap ends even
+        // when the codes in use span less.
+        assert_eq!(
+            code_colors(vec![0, 1023], Colormap::Viridis),
+            [Colormap::Viridis.rgb(0.), Colormap::Viridis.rgb(1.)].concat()
         );
     }
 }

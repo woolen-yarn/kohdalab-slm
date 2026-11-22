@@ -6,7 +6,7 @@
 //! sample reference axis minus the SLM mounting angle. The wave coordinate is
 //! `u = x cos θ + y sin θ` and the band coordinate is `v = -x sin θ + y cos θ`.
 //!
-//! Code conversion is the notebook compatibility mode:
+//! Notebook compatibility uses
 //! `round(phase0 + φ/(2π) · period) mod period`, with NumPy's ties-to-even
 //! rounding and floating-point remainder semantics.
 
@@ -22,9 +22,22 @@ pub struct Raster {
     pub height: u32,
 }
 
-/// Generator-side phase→code calibration (notebook compatibility mode).
+/// How generated phase is converted to digital codes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseMapping {
+    /// Old configurations and experiments omit this field.
+    #[default]
+    Notebook,
+    /// Santec SLM-200 manual, Figure 42, with the device calibrated for 2π.
+    SantecFullScale,
+}
+
+/// Generator-side phase→code mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PhaseCalibration {
+    #[serde(default)]
+    pub mapping: PhaseMapping,
     /// Code offset added before wrapping (`phase0`, notebook `phase0=136`).
     pub phase0: f64,
     /// Number of codes per 2π (`period`, notebook `period=888`).
@@ -54,14 +67,16 @@ impl GenerationProfile {
             return Err("Raster size must be positive".into());
         }
         self.optics.validate()?;
-        if self.calibration.code_period == 0 {
-            return Err("Code period must be at least 1".into());
-        }
-        if u32::from(self.max_code) + 1 < self.calibration.code_period {
-            return Err(format!(
-                "Code period {} exceeds the device code range 0–{}",
-                self.calibration.code_period, self.max_code
-            ));
+        if self.calibration.mapping == PhaseMapping::Notebook {
+            if self.calibration.code_period == 0 {
+                return Err("Code period must be at least 1".into());
+            }
+            if u32::from(self.max_code) + 1 < self.calibration.code_period {
+                return Err(format!(
+                    "Code period {} exceeds the device code range 0–{}",
+                    self.calibration.code_period, self.max_code
+                ));
+            }
         }
         if !self.calibration.phase0.is_finite() {
             return Err("phase0 must be finite".into());
@@ -272,7 +287,7 @@ impl PatternSpec {
                 let phase = raster_phase(profile, geometry, |x, y| {
                     let u = x * c + y * s;
                     wave.phase(u)
-                });
+                })?;
                 let code = phase_to_code(&phase, profile);
                 Ok(Rendered::Phase { phase, code })
             }
@@ -302,7 +317,7 @@ impl PatternSpec {
                     };
                     let band = np_remainder(np_floor_divide(v, width_px), n) as usize;
                     waves[band.min(waves.len() - 1)].phase(u)
-                });
+                })?;
                 let code = phase_to_code(&phase, profile);
                 Ok(Rendered::Phase { phase, code })
             }
@@ -344,6 +359,9 @@ fn rotation(
         }
         AngleUnit::Radian => geometry.rotation.value - profile.mount_angle_deg.to_radians(),
     };
+    if !radians.is_finite() {
+        return Err("Rotation angle must be finite".into());
+    }
     Ok((radians.cos(), radians.sin()))
 }
 
@@ -369,7 +387,11 @@ impl PreparedWave {
             (Some(p), Waveform::Ramp) => np_remainder((u / p) * TAU, TAU),
             // Notebook: where((X_rot // (period_px / 2)) % 2 == 0, 0, π).
             (Some(p), Waveform::Binary) => {
-                if np_remainder(np_floor_divide(u, p / 2.), 2.) == 0. {
+                let parity = np_remainder(np_floor_divide(u, p / 2.), 2.);
+                if !parity.is_finite() {
+                    return f64::NAN;
+                }
+                if parity == 0. {
                     0.
                 } else {
                     std::f64::consts::PI
@@ -388,7 +410,7 @@ fn raster_phase(
     profile: &GenerationProfile,
     geometry: &Geometry,
     phase_at: impl Fn(f64, f64) -> f64,
-) -> PhaseFrame {
+) -> Result<PhaseFrame, String> {
     let Raster { width, height } = profile.raster;
     let x0 = -(i64::from(width) / 2) + i64::from(geometry.center_offset_px[0]);
     let y0 = -(i64::from(height) / 2) + i64::from(geometry.center_offset_px[1]);
@@ -396,28 +418,41 @@ fn raster_phase(
     for j in 0..i64::from(height) {
         let y = (j + y0) as f64;
         for i in 0..i64::from(width) {
-            data.push(phase_at((i + x0) as f64, y));
+            let phase = phase_at((i + x0) as f64, y);
+            if !phase.is_finite() {
+                return Err("Pattern parameters produced a non-finite phase. Check the wave period and phase offset.".into());
+            }
+            data.push(phase);
         }
     }
-    PhaseFrame {
+    Ok(PhaseFrame {
         width,
         height,
         data,
-    }
+    })
 }
 
-/// Notebook `convert_phase_value_to_input_vlotage`.
+/// Convert generated radians to the selected calibration's raw device codes.
 pub fn phase_to_code(phase: &PhaseFrame, profile: &GenerationProfile) -> CodeFrame {
     let period = f64::from(profile.calibration.code_period);
     let phase0 = profile.calibration.phase0;
-    CodeFrame {
-        width: phase.width,
-        height: phase.height,
-        data: phase
+    let max_code = f64::from(profile.max_code);
+    let data = match profile.calibration.mapping {
+        PhaseMapping::Notebook => phase
             .data
             .iter()
             .map(|&p| np_remainder((phase0 + (p / TAU) * period).round_ties_even(), period) as u16)
             .collect(),
+        PhaseMapping::SantecFullScale => phase
+            .data
+            .iter()
+            .map(|&p| (p.rem_euclid(TAU) / TAU * max_code).round() as u16)
+            .collect(),
+    };
+    CodeFrame {
+        width: phase.width,
+        height: phase.height,
+        data,
     }
 }
 
@@ -463,12 +498,44 @@ mod tests {
                 magnification: 1. / 75.,
             },
             calibration: PhaseCalibration {
+                mapping: Default::default(),
                 phase0: 136.,
                 code_period: 888,
             },
             mount_angle_deg: 0.,
             default_stripe_width_px: 1,
         }
+    }
+
+    #[test]
+    fn extremely_small_period_rejects_non_finite_phase() {
+        for waveform in [Waveform::Ramp, Waveform::Binary] {
+            let pattern = PatternSpec::SingleWave {
+                wave: wave(f64::from_bits(1), waveform),
+                geometry: geometry(0.),
+            };
+            assert!(pattern.render(&profile(4, 2)).is_err());
+        }
+    }
+
+    #[test]
+    fn santec_full_scale_maps_phase_to_ten_bit_codes() {
+        let mut profile = profile(8, 1);
+        profile.calibration.code_period = 0;
+        assert!(profile.validate().is_err());
+        profile.calibration.mapping = PhaseMapping::SantecFullScale;
+        assert!(profile.validate().is_ok());
+        let phase = PhaseFrame {
+            width: 8,
+            height: 1,
+            data: [0., 0.25, 0.5, 0.75, 0.9999, 1., -0.25, 1.25]
+                .map(|cycle| cycle * TAU)
+                .into(),
+        };
+        assert_eq!(
+            phase_to_code(&phase, &profile).data,
+            [0, 256, 512, 767, 1023, 0, 767, 256]
+        );
     }
 
     fn wave(period_px: f64, waveform: Waveform) -> WaveComponent {

@@ -247,7 +247,11 @@ pub fn run(dir: &Path) -> Result<(), String> {
         loaded.experiment.items[csv_index].clone(),
     ];
     let export_dir = dir.join("export");
-    let files = subset.export(&export_dir, &HeatmapKind::ALL)?;
+    let files = subset.export(
+        &export_dir,
+        &HeatmapKind::ALL,
+        slm_core::heatmap::Colormap::default(),
+    )?;
     let pngs = files
         .iter()
         .filter(|p| p.extension().is_some_and(|e| e == "png"))
@@ -368,8 +372,14 @@ pub fn run(dir: &Path) -> Result<(), String> {
         refused && !demo.lock().open,
         "output hidden, state unknown",
     );
-    let summary = worker.shutdown(Duration::from_secs(10))?;
-    c.check("shutdown", true, summary);
+    let result = worker.shutdown(Duration::from_secs(10));
+    let unknown_reported =
+        matches!(&result, Err(error) if error.contains("unknown") && error.contains("unverified"));
+    c.check(
+        "shutdown preserves unknown output status",
+        unknown_reported,
+        result.unwrap_or_else(|error| error),
+    );
 
     let report = serde_json::json!({
         "passed": c.failed == 0,

@@ -34,6 +34,39 @@ pub fn configure(ctx: &egui::Context) {
                 .insert(0, "windows-ui".into());
         }
     }
+    // Installed fonts only; do not redistribute proprietary font files.
+    let candidates: Vec<std::path::PathBuf> = if cfg!(target_os = "macos") {
+        vec![
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc".into(),
+            "/System/Library/Fonts/Hiragino Sans GB.ttc".into(),
+        ]
+    } else if cfg!(windows) {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()),
+        );
+        vec![
+            root.join("Fonts/YuGothR.ttc"),
+            root.join("Fonts/msgothic.ttc"),
+        ]
+    } else {
+        vec!["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".into()]
+    };
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "cjk-fallback".into(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push("cjk-fallback".into());
+            }
+            break;
+        }
+    }
     ctx.set_fonts(fonts);
     // The app is always dark, whatever the OS reports (egui otherwise follows
     // the system theme and switches to its unstyled light style). Only this

@@ -167,7 +167,26 @@ struct Capture {
     result: Option<Result<(), String>>,
 }
 
+enum ExportEvent {
+    Progress(usize, usize),
+    Finished(Result<Vec<PathBuf>, String>),
+}
+struct ExportJob {
+    cancellable: bool,
+    receiver: std::sync::mpsc::Receiver<ExportEvent>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+type RemovedRows = (String, Vec<(usize, ExperimentItem, Option<PathBuf>)>);
+
 pub struct App {
+    journal: Option<crate::journal::Journal>,
+    undo_removed: Option<RemovedRows>,
+    dialog_dirs: std::collections::HashMap<String, PathBuf>,
+    settings_draft: Option<slm_device::profile::DeviceProfile>,
+    notice: Option<(std::time::Instant, Level, String)>,
+    export_job: Option<ExportJob>,
+    pub export_progress: Option<(usize, usize)>,
     pub config: AppConfig,
     pub config_path: PathBuf,
     pub config_dirty: bool,
@@ -203,6 +222,13 @@ pub struct App {
     mode_ack: bool,
     confirm_discard: Option<Discard>,
     shut_down: bool,
+    shutdown_reply: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    shutdown_started: Option<std::time::Instant>,
+    shutdown_error: Option<String>,
+    shutdown_done: bool,
+    confirm_close: bool,
+    close_allowed: bool,
+    pending_config_load: Option<PathBuf>,
     capture: Option<Capture>,
     glyphs_checked: bool,
     pub left_collapsed: bool,
@@ -278,12 +304,14 @@ impl App {
         };
         if options.demo {
             config.output.backend = BackendKind::Demo;
-            config.output.display = Some(demo_displays()[1].selection());
+            let display = demo_displays()[1].selection();
             config.output.confirmed_mode = Some(ModeConfirmation {
+                monitor_device_path: display.monitor_device_path.clone(),
                 mode: InputMode::Hz60,
                 confirmed_unix_s: 0,
                 note: "Demo: simulated confirmation, no hardware".into(),
             });
+            config.output.display = Some(display);
         }
         let demo_control = DemoControl::default();
         let repaint = ctx.clone();
@@ -293,6 +321,13 @@ impl App {
         );
         let profile = config.profile.clone();
         let mut app = Self {
+            journal: None,
+            undo_removed: None,
+            dialog_dirs: Default::default(),
+            settings_draft: None,
+            notice: None,
+            export_job: None,
+            export_progress: None,
             config_path: options.config_path,
             config_dirty: false,
             demo: options.demo,
@@ -348,15 +383,23 @@ impl App {
             mode_note: String::new(),
             mode_ack: false,
             confirm_discard: None,
+            confirm_close: false,
+            close_allowed: false,
+            pending_config_load: None,
             shut_down: false,
+            shutdown_reply: None,
+            shutdown_started: None,
+            shutdown_error: None,
+            shutdown_done: false,
             glyphs_checked: false,
             left_collapsed: false,
             device_expanded: false,
             settings_open: false,
-            wavelength_nm: profile
-                .device_wavelength_nm
-                .filter(|nm| nm.fract() == 0. && (450. ..=1600.).contains(nm))
-                .map_or_else(|| "795".into(), |nm| nm.to_string()),
+            wavelength_nm: Self::initial_wavelength_nm(
+                profile
+                    .device_wavelength_nm
+                    .or(options.demo.then_some(795.)),
+            ),
             wavelength_usb_device: "1".into(),
             wavelength_busy: false,
             wavelength_status: None,
@@ -375,6 +418,16 @@ impl App {
             }),
             config,
         };
+        if !app.demo {
+            match crate::journal::Journal::open(&app.config_path) {
+                Ok(journal) => {
+                    let path = journal.path.clone();
+                    app.journal = Some(journal);
+                    app.push_log(Level::Info, format!("Session log: {}", path.display()));
+                }
+                Err(e) => app.push_log(Level::Error, format!("Session log unavailable: {e}")),
+            }
+        }
         app.config_path_text = ui::tilde(&app.config_path);
         if let Some(warning) = warning {
             app.push_log(Level::Warn, warning);
@@ -391,11 +444,36 @@ impl App {
         app
     }
 
+    fn journal_event(&mut self, event: &str, details: serde_json::Value) {
+        let simulated = self.config.output.backend == BackendKind::Demo;
+        if let Some(journal) = &mut self.journal
+            && let Err(e) = journal.append(event, details, simulated)
+        {
+            self.journal = None;
+            self.notice = Some((
+                std::time::Instant::now(),
+                Level::Error,
+                format!("Session log write failed: {e}"),
+            ));
+            self.log.push_back(LogLine {
+                time: utc_clock(),
+                level: Level::Error,
+                text: format!("Session log write failed; recording stopped: {e}"),
+            });
+        }
+    }
+
     pub fn push_log(&mut self, level: Level, text: impl Into<String>) {
+        let text = text.into();
+        self.notice = Some((std::time::Instant::now(), level, text.clone()));
+        self.journal_event(
+            "log",
+            serde_json::json!({"level":format!("{level:?}"), "message":text}),
+        );
         self.log.push_back(LogLine {
             time: utc_clock(),
             level,
-            text: text.into(),
+            text,
         });
         while self.log.len() > MAX_LOG {
             self.log.pop_front();
@@ -407,7 +485,16 @@ impl App {
     }
 
     fn device_busy(&self) -> bool {
-        self.wavelength_busy || !matches!(self.device_state, DeviceState::Disconnected)
+        self.shut_down
+            || self.wavelength_busy
+            || !matches!(self.device_state, DeviceState::Disconnected)
+    }
+
+    fn initial_wavelength_nm(recorded: Option<f64>) -> String {
+        let range = slm_device::wavelength::SANTEC_WAVELENGTH_NM;
+        recorded
+            .filter(|nm| nm.fract() == 0. && range.contains(&(*nm as u32)))
+            .map_or_else(String::new, |nm| nm.to_string())
     }
 
     fn request_wavelength(&mut self, write: bool) {
@@ -433,6 +520,10 @@ impl App {
         match self.worker.send(command) {
             Ok(()) => {
                 self.wavelength_busy = true;
+                if write && self.config.output.backend == BackendKind::WindowsDisplay {
+                    self.config_dirty |= self.config.profile.device_wavelength_nm.take().is_some();
+                    self.config_dirty |= self.config.profile.device_phase_raw.take().is_some();
+                }
                 self.wavelength_status = Some((
                     if write {
                         "Writing wavelength…"
@@ -469,16 +560,152 @@ impl App {
         });
     }
 
-    pub fn save_config(&mut self) {
-        match self.config.save(&self.config_path) {
+    pub fn save_config(&mut self) -> bool {
+        self.save_config_to(&self.config_path.clone())
+    }
+
+    pub fn save_config_to(&mut self, path: &Path) -> bool {
+        self.config_dirty = true;
+        match self.config.save(path) {
             Ok(()) => {
+                self.config_path = path.to_owned();
+                self.config_path_text = path.display().to_string();
                 self.config_dirty = false;
-                self.push_log(
-                    Level::Info,
-                    format!("Config saved: {}", self.config_path.display()),
-                );
+                self.push_log(Level::Info, format!("Config saved: {}", path.display()));
+                true
             }
-            Err(e) => self.push_log(Level::Error, format!("Config not saved: {e}")),
+            Err(e) => {
+                self.push_log(Level::Error, format!("Config not saved: {e}"));
+                false
+            }
+        }
+    }
+
+    pub fn load_config(&mut self, path: &Path) {
+        match AppConfig::load(path) {
+            Ok((config, note)) => {
+                if let Some(note) = note {
+                    self.push_log(Level::Warn, note);
+                }
+                self.wavelength_nm =
+                    Self::initial_wavelength_nm(config.profile.device_wavelength_nm);
+                self.wavelength_status = None;
+                self.config = config;
+                self.settings_draft = None;
+                self.mode_ack = false;
+                self.config_path = path.to_owned();
+                self.config_path_text = path.display().to_string();
+                self.config_dirty = false;
+                self.displays.clear();
+                self.refresh_displays();
+                self.push_log(Level::Info, format!("Config loaded: {}", path.display()));
+            }
+            Err(e) => self.push_log(Level::Error, format!("Config not loaded: {e}")),
+        }
+    }
+
+    /// Return true only when a native close may proceed.
+    pub fn request_close(&mut self) -> bool {
+        if self.shutdown_done {
+            return true;
+        }
+        if self.shut_down {
+            return false;
+        }
+        if self
+            .settings_draft
+            .as_ref()
+            .is_some_and(|draft| draft != &self.config.profile)
+        {
+            self.settings_open = true;
+            self.push_log(Level::Warn, "Settings has unconfirmed edits. Choose Use Settings or Cancel Settings before closing.");
+            return false;
+        }
+        if self.export_job.is_some() {
+            self.push_log(
+                Level::Warn,
+                if self.export_job.as_ref().is_some_and(|j| j.cancellable) {
+                    "Export is running. Wait for completion or cancel Export before closing."
+                } else {
+                    "File save is running. Wait for completion before closing."
+                },
+            );
+            return false;
+        }
+        if self.wavelength_busy {
+            self.push_log(
+                Level::Warn,
+                "Waiting for wavelength operation (15 s timeout); no automatic retry.",
+            );
+            return false;
+        }
+        if !self.close_allowed && (self.experiment.dirty || (!self.demo && self.config_dirty)) {
+            self.confirm_close = true;
+            return false;
+        }
+        self.begin_shutdown();
+        false
+    }
+
+    fn begin_shutdown(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        self.queued_row = None;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.shut_down = true;
+        self.shutdown_started = Some(std::time::Instant::now());
+        match self.worker.send(Command::Shutdown { reply: sender }) {
+            Ok(()) => {
+                self.shutdown_reply = Some(receiver);
+                self.push_log(Level::Info, "Resetting output before close…");
+            }
+            Err(e) => {
+                self.shutdown_error = Some(e.clone());
+                self.push_log(Level::Error, e);
+            }
+        }
+    }
+
+    fn process_shutdown(&mut self, ctx: &egui::Context) {
+        let result = self
+            .shutdown_reply
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Worker stopped without confirming reset".into()))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            });
+        if let Some(result) = result {
+            self.shutdown_reply = None;
+            self.journal_event(
+                "shutdown",
+                serde_json::json!({"success":result.is_ok(), "result":result}),
+            );
+            match result {
+                Ok(summary) => {
+                    self.push_log(Level::Info, summary);
+                    self.shutdown_done = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(error) => {
+                    self.push_log(Level::Error, error.clone());
+                    self.shutdown_error = Some(error);
+                }
+            }
+        } else if self.shut_down && !self.shutdown_done {
+            if self.shutdown_error.is_none()
+                && self
+                    .shutdown_started
+                    .is_some_and(|t| t.elapsed() > Duration::from_secs(5))
+            {
+                let error = "Reset has not been confirmed. Output state is unknown; still waiting for the device.".to_string();
+                self.push_log(Level::Error, error.clone());
+                self.shutdown_error = Some(error);
+            }
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
@@ -508,6 +735,7 @@ impl App {
                     }
                 }
                 Event::State(state) => {
+                    self.journal_event("device_state", serde_json::json!({"state":format!("{state:?}"), "profile":self.config.profile}));
                     if !state.is_connected() {
                         self.queued_row = None;
                     }
@@ -540,6 +768,7 @@ impl App {
                         Level::Info,
                         format!("Applied {label}: {}", receipt.verification.label()),
                     );
+                    self.journal_event("applied", serde_json::json!({"request":request, "item_id":record.item_id, "label":record.label, "summary":record.summary, "spec":record.spec, "receipt":receipt, "profile":self.config.profile}));
                     self.status = ApplyStatus::Applied(record, receipt);
                 }
                 Event::ApplyFailed {
@@ -572,6 +801,7 @@ impl App {
                             }
                         ),
                     );
+                    self.journal_event("apply_failed", serde_json::json!({"request":request, "item_id":record.item_id, "error":error, "output_known":output_known}));
                     self.status = ApplyStatus::Failed {
                         record,
                         error,
@@ -581,16 +811,36 @@ impl App {
                 Event::Wavelength(result) => {
                     self.wavelength_busy = false;
                     let (text, color, level) = match result {
-                        Ok(nm) => {
-                            self.wavelength_nm = nm.to_string();
-                            let value = Some(f64::from(nm));
-                            self.config_dirty |= self.config.profile.device_wavelength_nm != value;
-                            self.config.profile.device_wavelength_nm = value;
-                            let source = if self.config.output.backend == BackendKind::Demo {
+                        Ok(reading) => {
+                            let nm = reading.nm;
+                            let simulated = self.config.output.backend == BackendKind::Demo;
+                            if !simulated || self.demo {
+                                self.wavelength_nm = nm.to_string();
+                                let value = Some(f64::from(nm));
+                                self.config_dirty |=
+                                    self.config.profile.device_wavelength_nm != value;
+                                self.config.profile.device_wavelength_nm = value;
+                            }
+                            let source = if simulated {
                                 "Simulated readback"
                             } else {
                                 "USB readback"
                             };
+                            if !simulated || self.demo {
+                                self.config_dirty |=
+                                    self.config.profile.device_phase_raw != reading.phase_bits;
+                                self.config.profile.device_phase_raw = reading.phase_bits;
+                            }
+                            self.journal_event(
+                                "wavelength_readback",
+                                serde_json::json!({"nm": nm, "phase_raw":reading.phase_bits}),
+                            );
+                            if let Some(bits) = reading.phase_bits {
+                                self.push_log(
+                                    Level::Info,
+                                    format!("Maximum phase readback (SDK raw): 0x{bits:08X}"),
+                                );
+                            }
                             (format!("{source}: {nm} nm"), TEAL, Level::Info)
                         }
                         Err(error) => (error, ERROR, Level::Error),
@@ -648,6 +898,7 @@ impl App {
                 code: self.config.profile.reset_code,
             }),
         };
+        self.journal_event("apply_requested", serde_json::json!({"request":request, "item_id":record.item_id, "label":record.label, "summary":record.summary, "spec":record.spec, "profile":self.config.profile}));
         self.status = ApplyStatus::Applying(record.clone());
         self.pending = Some((request, record));
         let _ = self.worker.send(Command::Reset { request });
@@ -815,7 +1066,51 @@ impl App {
         self.experiment.dirty = true;
     }
 
+    pub fn undo_remove(&mut self) {
+        let Some((id, removed)) = self.undo_removed.take() else {
+            return;
+        };
+        if id != self.experiment.experiment.id {
+            return;
+        }
+        let mut first = None;
+        for (index, item, asset) in removed {
+            if self
+                .experiment
+                .experiment
+                .items
+                .iter()
+                .any(|i| i.id == item.id)
+            {
+                continue;
+            }
+            if let Some(path) = asset {
+                self.experiment.pending_assets.insert(item.id.clone(), path);
+            }
+            let index = index.min(self.experiment.experiment.items.len());
+            self.experiment.experiment.items.insert(index, item);
+            first.get_or_insert(index);
+        }
+        self.experiment.dirty = true;
+        self.set_selection(first);
+        self.reveal_row = first;
+        self.queued_row = None;
+        self.push_log(Level::Info, "Restored removed rows. Nothing was sent.");
+    }
+
     fn remove_rows(&mut self, all: bool) {
+        let removed = self
+            .experiment
+            .experiment
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| all || self.selected_rows.contains(i))
+            .map(|(i, item)| (i, item.clone(), self.experiment.asset_path(item)))
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            self.undo_removed = Some((self.experiment.experiment.id.clone(), removed));
+        }
         let items = &mut self.experiment.experiment.items;
         let count = items.len();
         let first = self.selected_rows.first().copied();
@@ -935,6 +1230,8 @@ impl App {
             });
             self.experiment.push(item);
         }
+        self.set_selection(Some(first_added));
+        self.queued_row = None;
         self.reveal_row = Some(first_added);
         self.push_log(
             Level::Info,
@@ -943,6 +1240,7 @@ impl App {
     }
 
     pub fn import_csv(&mut self, path: &Path) {
+        self.remember_directory("Import CSV", path);
         match self
             .experiment
             .import_csv(path, self.config.profile.generation)
@@ -963,15 +1261,24 @@ impl App {
         }
     }
 
-    pub fn save_experiment(&mut self, path: &Path) {
+    pub fn save_experiment(&mut self, path: &Path) -> bool {
+        self.remember_directory("Save list", path);
         match self.experiment.save(path) {
-            Ok(()) => self.push_log(Level::Info, format!("Experiment saved: {}", path.display())),
-            Err(e) => self.push_log(Level::Error, format!("Experiment not saved: {e}")),
+            Ok(()) => {
+                self.push_log(Level::Info, format!("Experiment saved: {}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.push_log(Level::Error, format!("Experiment not saved: {e}"));
+                false
+            }
         }
     }
 
     /// Loading never changes the output display and never sends a pattern.
     pub fn open_experiment(&mut self, path: &Path) {
+        self.remember_directory("Open list", path);
+        self.undo_removed = None;
         match ExperimentDoc::load(path) {
             Ok(doc) => {
                 self.push_log(
@@ -991,21 +1298,143 @@ impl App {
     }
 
     pub fn export_experiment(&mut self, dir: &Path) {
-        let kinds: Vec<HeatmapKind> = HeatmapKind::ALL
+        if self.export_job.is_some() {
+            return;
+        }
+        let kinds: Vec<_> = HeatmapKind::ALL
             .into_iter()
             .filter(|k| self.heatmaps.contains(k))
             .collect();
-        match self.experiment.export(dir, &kinds) {
-            Ok(files) => self.push_log(
-                Level::Info,
-                format!("Exported {} files to {}", files.len(), dir.display()),
-            ),
-            Err(e) => self.push_log(Level::Error, format!("Export failed: {e}")),
+        let doc = self.experiment.clone();
+        let colormap = self.config.preview_colormap;
+        let path = dir.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        self.export_progress = Some((0, doc.experiment.items.len()));
+        std::thread::spawn(move || {
+            let result = doc.export_with_progress(&path, &kinds, colormap, |done, total| {
+                if worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("Export cancelled; no completed export was published".into());
+                }
+                let _ = sender.send(ExportEvent::Progress(done, total));
+                Ok(())
+            });
+            let _ = sender.send(ExportEvent::Finished(result));
+        });
+        self.export_job = Some(ExportJob {
+            receiver,
+            cancel,
+            cancellable: true,
+        });
+    }
+
+    fn process_export(&mut self) {
+        let mut finished = None;
+        if let Some(job) = &self.export_job {
+            loop {
+                match job.receiver.try_recv() {
+                    Ok(ExportEvent::Progress(done, total)) => {
+                        self.export_progress = Some((done, total))
+                    }
+                    Ok(ExportEvent::Finished(result)) => {
+                        finished = Some(result);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        finished = Some(Err("Export worker stopped unexpectedly".into()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(result) = finished {
+            let single = self.export_job.as_ref().is_some_and(|j| !j.cancellable);
+            self.export_job = None;
+            self.export_progress = None;
+            match result {
+                Ok(files) if single => self.push_log(
+                    Level::Info,
+                    format!(
+                        "Saved {}",
+                        files
+                            .first()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    ),
+                ),
+                Ok(files) => self.push_log(
+                    Level::Info,
+                    format!(
+                        "Exported {} files to {}",
+                        files.len(),
+                        files
+                            .first()
+                            .and_then(|p| p.parent())
+                            .unwrap_or(Path::new("."))
+                            .display()
+                    ),
+                ),
+                Err(e) => self.push_log(Level::Error, format!("File output failed: {e}")),
+            }
         }
     }
 
-    fn save_preview(&mut self, png: bool) {
+    fn file_dialog(&self, purpose: &str) -> rfd::FileDialog {
+        let directory = self
+            .dialog_dirs
+            .get(purpose)
+            .cloned()
+            .or_else(|| {
+                self.experiment
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+            })
+            .or_else(|| self.config_path.parent().map(Path::to_path_buf));
+        let dialog = rfd::FileDialog::new().set_title(purpose);
+        match directory {
+            Some(p) => dialog.set_directory(p),
+            None => dialog,
+        }
+    }
+
+    fn remember_directory(&mut self, purpose: &str, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.dialog_dirs.insert(purpose.into(), parent.into());
+        }
+    }
+
+    pub fn save_preview_to(&mut self, path: &Path, png: bool) {
+        if self.export_job.is_some() {
+            return;
+        }
         let Some((_, source, caption)) = self.current_preview() else {
+            return;
+        };
+        let colormap = self.config.preview_colormap;
+        let path = path.to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::spawn(move || {
+            let result = source.save_to(&path, png, colormap).map(|()| vec![path]);
+            let _ = sender.send(ExportEvent::Finished(result));
+        });
+        self.export_progress = Some((0, 1));
+        self.export_job = Some(ExportJob {
+            receiver,
+            cancel,
+            cancellable: false,
+        });
+        self.push_log(Level::Info, format!("Saving {caption}…"));
+    }
+
+    fn save_preview(&mut self, png: bool) {
+        if self.export_job.is_some() {
+            return;
+        }
+        let Some((_, _, caption)) = self.current_preview() else {
             return;
         };
         let (name, extension) = if png {
@@ -1013,24 +1442,27 @@ impl App {
         } else {
             ("Santec CSV", "csv")
         };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(format!("pattern.{extension}"))
+        let filename: String = caption
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(80)
+            .collect();
+        let Some(path) = self
+            .file_dialog("Save pattern")
+            .set_file_name(format!("{filename}.{extension}"))
             .add_filter(name, &[extension])
             .save_file()
         else {
             return;
         };
-        let result = source.save_to(&path, png);
-        match result {
-            Ok(()) => self.push_log(
-                Level::Info,
-                format!("Saved {caption} to {}", path.display()),
-            ),
-            Err(error) => self.push_log(
-                Level::Error,
-                format!("Save {} failed: {error}", path.display()),
-            ),
-        }
+        self.remember_directory("Save pattern", &path);
+        self.save_preview_to(&path, png);
     }
 
     pub fn shutdown(&mut self) {
@@ -1067,7 +1499,9 @@ impl App {
     }
 
     fn apply_block(&self) -> Option<&'static str> {
-        if self.pending.is_some() {
+        if self.shut_down {
+            Some("Output session is shutting down")
+        } else if self.pending.is_some() {
             Some("Applying… wait for the result")
         } else if matches!(self.device_state, DeviceState::Unknown { .. }) {
             Some("Output unknown: disconnect, reselect and reconnect")
@@ -1147,7 +1581,10 @@ impl App {
             }
             Tab::Experiment => item_source(self.selected?)?,
         };
-        Some((source.key(), source, caption))
+        // The colormap is part of the image key (a change re-renders), but
+        // not of the source, so codes and digests never depend on it.
+        let key = format!("{}-{:?}", source.key(), self.config.preview_colormap);
+        Some((key, source, caption))
     }
 
     /// Every sweep value validated against the profile; cached per draft.
@@ -1184,7 +1621,8 @@ impl App {
             && self.preview.requested.as_deref() != Some(key.as_str())
         {
             self.preview.requested = Some(key.clone());
-            self.previewer.request(key, source);
+            self.previewer
+                .request(key, source, self.config.preview_colormap);
         }
         for result in self.previewer.try_results() {
             if self.preview.requested.as_deref() != Some(result.key.as_str()) {
@@ -1396,8 +1834,13 @@ impl eframe::App for App {
         }
         self.fit_window_once(ctx);
         self.process_events();
+        self.process_export();
+        self.process_shutdown(ctx);
+        if self.export_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.wavelength_busy {
+            if !self.request_close() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 return;
             }

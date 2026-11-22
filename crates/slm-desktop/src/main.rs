@@ -22,6 +22,7 @@ mod icon_tests {
         assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
     }
 }
+mod journal;
 mod layout;
 mod preview;
 mod smoke;
@@ -44,9 +45,13 @@ fn run_gui(options: app::AppOptions) -> Result<(), String> {
 fn run_gui_sized(options: app::AppOptions, size: [f32; 2], view: &str) -> Result<(), String> {
     let view = view.to_string();
     let title = if options.demo {
-        "KohdaLab SLM · DEMO · SIMULATED"
+        concat!(
+            "KohdaLab SLM v",
+            env!("CARGO_PKG_VERSION"),
+            " · DEMO · SIMULATED"
+        )
     } else {
-        "KohdaLab SLM"
+        concat!("KohdaLab SLM v", env!("CARGO_PKG_VERSION"))
     };
     eframe::run_native(
         title,
@@ -74,7 +79,30 @@ fn run_gui_sized(options: app::AppOptions, size: [f32; 2], view: &str) -> Result
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if let [flag, device, nm] = args.as_slice()
+        && flag == "--wavelength-helper"
+    {
+        let result = device
+            .parse::<u32>()
+            .ok()
+            .filter(|d| (1..=255).contains(d))
+            .zip(nm.parse::<u32>().ok())
+            .ok_or_else(|| "Invalid wavelength helper arguments".to_string())
+            .and_then(|(device, nm)| {
+                if nm != 0 && !slm_device::wavelength::SANTEC_WAVELENGTH_NM.contains(&nm) {
+                    return Err("Invalid wavelength".into());
+                }
+                slm_device::wavelength::wavelength_helper(device, (nm != 0).then_some(nm))
+            });
+        println!(
+            "{}",
+            serde_json::to_string(&result).expect("serialize helper result")
+        );
+        return;
+    }
     let result = match args.as_slice() {
+        [flag] if flag == "--version" => { println!("KohdaLab SLM {}", env!("CARGO_PKG_VERSION")); Ok(()) },
         [] => match slm_device::config::default_config_path() {
             Some(config_path) => run_gui(app::AppOptions {
                 config_path,

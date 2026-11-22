@@ -2,6 +2,7 @@
 // Deducing the phase type from ReadWL avoids choosing a calling convention
 // from unofficial wrappers. Both calls must agree on that type at compile time.
 #include <windows.h>
+#include <cstring>
 #include <tuple>
 #include <type_traits>
 #include "SLMFunc.h"
@@ -24,8 +25,9 @@ F load(HMODULE dll, const char* name) {
 }
 
 // Returns vendor SDK status or a bridge-specific error below -30000.
-extern "C" __declspec(dllexport) int kohdalab_santec_wavelength(
-    const wchar_t* sdk_path, DWORD device, DWORD request, DWORD* observed
+extern "C" __declspec(dllexport) int kohdalab_santec_wavelength_v2(
+    const wchar_t* sdk_path, DWORD device, DWORD request, DWORD* observed,
+    DWORD* phase_bits
 ) {
     HMODULE sdk = LoadLibraryExW(sdk_path, nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
@@ -46,15 +48,23 @@ extern "C" __declspec(dllexport) int kohdalab_santec_wavelength(
     }
     Phase phase{};
     result = read(device, observed, &phase);
+    if (result == 0) {
+        std::memcpy(phase_bits, &phase, sizeof(phase));
+    }
     if (result == 0 && request != 0 && request != *observed) {
         result = write(device, request, phase);
         if (result == 0) {
             const ULONGLONG deadline = GetTickCount64() + 50000;
-            Phase observed_phase{};
             do {
                 Sleep(1000);
-                result = read(device, observed, &observed_phase);
-                if (result == 0 && *observed == request && observed_phase == phase) break;
+                DWORD read_nm{};
+                Phase read_phase{};
+                result = read(device, &read_nm, &read_phase);
+                if (result == 0) {
+                    *observed = read_nm;
+                    std::memcpy(phase_bits, &read_phase, sizeof(read_phase));
+                    if (read_nm == request && read_phase == phase) break;
+                }
                 // 2 is SLM_BS (the device is busy).
                 if (result != 0 && result != 2) break;
                 result = -30003;

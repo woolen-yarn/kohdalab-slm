@@ -37,10 +37,11 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection,
-    DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS, EndPaint,
-    EnumDisplayMonitors, EnumDisplaySettingsW, GdiFlush, GetDC, GetMonitorInfoW, HDC, HMONITOR,
-    InvalidateRect, MONITOR_DEFAULTTONULL, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
-    PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetDIBitsToDevice, UpdateWindow,
+    DEVMODEW, DIB_RGB_COLORS, DISPLAYCONFIG_COLOR_ENCODING_RGB, DeleteDC, DeleteObject,
+    ENUM_CURRENT_SETTINGS, EndPaint, EnumDisplayMonitors, EnumDisplaySettingsW, GdiFlush, GetDC,
+    GetMonitorInfoW, HDC, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONULL, MONITORINFO,
+    MONITORINFOEXW, MonitorFromWindow, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject,
+    SetDIBitsToDevice, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
@@ -55,6 +56,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEACTIVATE, WM_PAINT, WM_SETCURSOR, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGED, WNDCLASSEXW,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+
+use windows_sys::Win32::System::RemoteDesktop::{
+    NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{WM_POWERBROADCAST, WM_WTSSESSION_CHANGE};
+
+use windows_sys::Win32::System::Power::{
+    POWERBROADCAST_SETTING, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+};
+use windows_sys::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 
 const WM_APP_SHOW: u32 = WM_APP + 1;
 const WM_APP_CLOSE: u32 = WM_APP + 2;
@@ -227,8 +238,12 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>, String> {
                 ..Default::default()
             };
             // SAFETY: as above. Bit 1 of the flags union is advancedColorEnabled.
-            let advanced_color = (unsafe { DisplayConfigGetDeviceInfo(&mut color.header) } == 0)
-                .then(|| unsafe { color.Anonymous.value } & 0x2 != 0);
+            let color_reported = unsafe { DisplayConfigGetDeviceInfo(&mut color.header) } == 0;
+            let advanced_color =
+                color_reported.then(|| unsafe { color.Anonymous.value } & 0x2 != 0);
+            let rgb_output =
+                color_reported.then_some(color.colorEncoding == DISPLAYCONFIG_COLOR_ENCODING_RGB);
+            let bits_per_channel = color_reported.then_some(color.bitsPerColorChannel);
 
             // SAFETY: without QDC_VIRTUAL_MODE_AWARE the union holds modeInfoIdx.
             let source_index = unsafe { source.Anonymous.modeInfoIdx } as usize;
@@ -318,6 +333,8 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>, String> {
                 clone_count,
                 rotated: target.rotation != DISPLAYCONFIG_ROTATION_IDENTITY,
                 advanced_color,
+                rgb_output,
+                bits_per_channel,
                 simulated: false,
                 gdi_name,
             });
@@ -566,6 +583,45 @@ unsafe extern "system" fn window_proc(
             1
         }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_WTSSESSION_CHANGE => {
+            invalidate(
+                hwnd,
+                &shared,
+                "Windows session changed (lock/unlock or remote session). Reconnect explicitly.",
+            );
+            0
+        }
+        WM_POWERBROADCAST => {
+            if wparam == 0x8013 && lparam != 0 {
+                // SAFETY: Windows supplies POWERBROADCAST_SETTING for this message.
+                let setting = unsafe { &*(lparam as *const POWERBROADCAST_SETTING) };
+                if setting.PowerSetting.data1 == GUID_CONSOLE_DISPLAY_STATE.data1
+                    && setting.PowerSetting.data2 == GUID_CONSOLE_DISPLAY_STATE.data2
+                    && setting.PowerSetting.data3 == GUID_CONSOLE_DISPLAY_STATE.data3
+                    && setting.PowerSetting.data4 == GUID_CONSOLE_DISPLAY_STATE.data4
+                    && setting.DataLength >= 4
+                {
+                    let state =
+                        unsafe { std::ptr::read_unaligned(setting.Data.as_ptr().cast::<u32>()) };
+                    if state != 1 {
+                        invalidate(
+                            hwnd,
+                            &shared,
+                            "Windows display turned off or dimmed. Reconnect explicitly.",
+                        );
+                    }
+                }
+            }
+            // Suspend and all resume events invalidate output; never auto-resume.
+            if matches!(wparam, 4 | 6 | 7 | 18) {
+                invalidate(
+                    hwnd,
+                    &shared,
+                    "Windows suspend/resume interrupted output. Reconnect explicitly.",
+                );
+            }
+            1
+        }
         WM_DISPLAYCHANGE => {
             invalidate(hwnd, &shared, "Windows display mode or layout changed.");
             0
@@ -642,6 +698,8 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_DESTROY => {
+            unsafe { WTSUnRegisterSessionNotification(hwnd) };
+
             // SAFETY: ends this thread's message loop.
             unsafe { PostQuitMessage(0) };
             0
@@ -736,6 +794,24 @@ impl OutputWindow {
                     let _ = tx.send(Err("CreateWindowExW failed".into()));
                     return;
                 }
+                // SAFETY: registered on the owning thread; fail closed if registration fails.
+                if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } == 0 {
+                    unsafe { DestroyWindow(hwnd) };
+                    let _ = tx.send(Err(
+                        "Cannot register Windows session safety notifications".into()
+                    ));
+                    return;
+                }
+                let power_notification = unsafe {
+                    RegisterPowerSettingNotification(hwnd, &GUID_CONSOLE_DISPLAY_STATE, 0)
+                };
+                if power_notification == 0 {
+                    unsafe { DestroyWindow(hwnd) };
+                    let _ = tx.send(Err(
+                        "Cannot register display power safety notifications".into()
+                    ));
+                    return;
+                }
                 let _ = tx.send(Ok(hwnd as usize));
                 let mut msg = MSG::default();
                 // SAFETY: standard message loop for this thread's window.
@@ -745,6 +821,7 @@ impl OutputWindow {
                         DispatchMessageW(&msg);
                     }
                 }
+                unsafe { UnregisterPowerSettingNotification(power_notification) };
                 WINDOW_SHARED.with(|s| *s.borrow_mut() = None);
             })
             .map_err(|e| format!("Start output window thread: {e}"))?;

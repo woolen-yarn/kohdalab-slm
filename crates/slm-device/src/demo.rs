@@ -81,6 +81,8 @@ pub fn demo_displays() -> Vec<DisplayInfo> {
                 clone_count: 1,
                 rotated: false,
                 advanced_color: Some(false),
+                rgb_output: Some(true),
+                bits_per_channel: Some(8),
                 simulated: true,
             }
         };

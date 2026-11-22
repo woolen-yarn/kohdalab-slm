@@ -9,6 +9,7 @@ use super::*;
 use crate::layout::{Columns, Form, Tone, panel_toggle, rect};
 use crate::theme::{BORDER, TEXT};
 use eframe::egui::{Color32, Pos2, Rect, Vec2};
+use slm_core::heatmap::Colormap;
 
 const GREEN: Color32 = Color32::from_rgb(100, 196, 146);
 const HEADER_FILL: Color32 = Color32::from_rgb(45, 46, 52);
@@ -100,6 +101,160 @@ impl App {
                     );
                 }
             });
+        if let Some((at, level, text)) = &self.notice
+            && at.elapsed() < std::time::Duration::from_secs(7)
+        {
+            egui::Area::new(egui::Id::new("operation-notice"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-16., -16.])
+                .interactable(false)
+                .show(&ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(420.);
+                        ui.colored_label(
+                            match level {
+                                Level::Error => ERROR,
+                                Level::Warn => AMBER,
+                                Level::Info => TEAL,
+                            },
+                            text,
+                        );
+                    });
+                });
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        if !ctx
+            .memory(|m| m.focused())
+            .is_some_and(|id| egui::TextEdit::load_state(&ctx, id).is_some())
+            && !self.settings_open
+            && !self.confirm_close
+            && !self.shut_down
+            && self.pending_config_load.is_none()
+        {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+                && let Some(path) = self
+                    .experiment
+                    .path
+                    .clone()
+                    .or_else(|| self.pick_save_path())
+            {
+                self.save_experiment(&path);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
+                && self.apply_block().is_none()
+                && let Some(index) = self.selected
+            {
+                self.apply_experiment_item(index);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+                self.undo_remove();
+            }
+        }
+        self.unsaved_dialogs(&ctx);
+    }
+
+    fn unsaved_dialogs(&mut self, ctx: &egui::Context) {
+        if self.shut_down && !self.shutdown_done {
+            let mut force = false;
+            egui::Modal::new(egui::Id::new("shutdown-progress")).show(ctx, |ui| {
+                ui.heading("Closing output session");
+                if let Some(error) = &self.shutdown_error {
+                    ui.colored_label(ERROR, error);
+                    ui.label("Check the SLM before continuing an experiment. Closing this app does not prove the optical state.");
+                    force = ui.button("Close Anyway").clicked();
+                } else { ui.label("Resetting output before close…"); ui.spinner(); }
+            });
+            if force {
+                self.journal_event(
+                    "shutdown_forced",
+                    serde_json::json!({"error":self.shutdown_error}),
+                );
+                self.shutdown_done = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else if self.confirm_close {
+            let response = egui::Modal::new(egui::Id::new("unsaved-close")).show(ctx, |ui| {
+                ui.heading("Save changes before closing?");
+                if self.experiment.dirty {
+                    ui.label("The pattern list has unsaved changes.");
+                }
+                if !self.demo && self.config_dirty {
+                    ui.label("The configuration has unsaved changes.");
+                }
+                if let Some(last) = self
+                    .log
+                    .back()
+                    .filter(|line| matches!(line.level, Level::Error))
+                {
+                    ui.colored_label(ERROR, &last.text);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        return 1;
+                    }
+                    if ui.button("Discard and Close").clicked() {
+                        return 2;
+                    }
+                    if ui.button("Save and Close").clicked() {
+                        return 3;
+                    }
+                    0
+                })
+                .inner
+            });
+            let action = response.inner;
+            if action == 1 || response.should_close() {
+                self.confirm_close = false;
+            }
+            if action == 2 || (action == 3 && self.save_changes_before_close()) {
+                self.confirm_close = false;
+                self.close_allowed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else if let Some(path) = self.pending_config_load.clone() {
+            let response = egui::Modal::new(egui::Id::new("unsaved-config-load")).show(ctx, |ui| {
+                ui.heading("Replace unsaved configuration?");
+                ui.label("Load will discard the current configuration changes.");
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        return 1;
+                    }
+                    if ui.button("Discard and Load").clicked() {
+                        return 2;
+                    }
+                    0
+                })
+                .inner
+            });
+            if response.inner == 2 {
+                self.load_config(&path);
+            }
+            if response.inner != 0 || response.should_close() {
+                self.pending_config_load = None;
+            }
+        }
+    }
+
+    fn save_changes_before_close(&mut self) -> bool {
+        if self.experiment.dirty {
+            let Some(path) = self
+                .experiment
+                .path
+                .clone()
+                .or_else(|| self.pick_save_path())
+            else {
+                return false;
+            };
+            if !self.save_experiment(&path) {
+                return false;
+            }
+        }
+        if !self.demo && self.config_dirty {
+            let path = expand_home(self.config_path_text.trim());
+            if !self.save_config_to(&path) {
+                return false;
+            }
+        }
+        true
     }
 
     // ----- left rail -----------------------------------------------------
@@ -150,7 +305,14 @@ impl App {
         let (browse, load, save);
         {
             let mut f = Form::new(ui, origin);
-            f.group(rect(0., 0., w, 96.), "Config");
+            f.group(
+                rect(0., 0., w, 96.),
+                if self.config_dirty {
+                    "Config · unsaved"
+                } else {
+                    "Config"
+                },
+            );
             f.path(
                 "config-path",
                 rect(11., 27., inner - 78., H),
@@ -171,10 +333,12 @@ impl App {
             save = f.button_with(
                 rect(19. + half, 59., inner - 8. - half, H),
                 "Save",
-                !self.demo,
+                !self.demo && !self.wavelength_busy,
                 Tone::Neutral,
                 Some(if self.demo {
                     "Demo config is temporary"
+                } else if self.wavelength_busy {
+                    "Wait for the wavelength operation to finish"
                 } else {
                     "Save profile and output settings"
                 }),
@@ -189,27 +353,15 @@ impl App {
         }
         if load {
             let path = expand_home(self.config_path_text.trim());
-            match AppConfig::load(&path) {
-                Ok((config, note)) => {
-                    if let Some(note) = note {
-                        self.push_log(Level::Warn, note);
-                    }
-                    self.config = config;
-                    self.config_path = path;
-                    self.config_dirty = false;
-                    self.displays.clear();
-                    self.refresh_displays();
-                    self.push_log(
-                        Level::Info,
-                        format!("Config loaded: {}", self.config_path.display()),
-                    );
-                }
-                Err(e) => self.push_log(Level::Error, format!("Config not loaded: {e}")),
+            if self.config_dirty {
+                self.pending_config_load = Some(path);
+            } else {
+                self.load_config(&path);
             }
         }
         if save {
-            self.config_path = expand_home(self.config_path_text.trim());
-            self.save_config();
+            let path = expand_home(self.config_path_text.trim());
+            self.save_config_to(&path);
         }
         96.
     }
@@ -288,14 +440,19 @@ impl App {
                 .collect();
             if f.combo("backend", rect(fx, y, field_w, H), &mut backend, &options) {
                 self.config.output.backend = backend;
+                self.wavelength_nm =
+                    Self::initial_wavelength_nm(self.config.profile.device_wavelength_nm);
+                self.wavelength_status = None;
                 self.config.output.display = None;
+                self.config.output.confirmed_mode = None;
+                self.mode_ack = false;
                 self.displays.clear();
                 self.refresh_displays();
                 self.save_config();
             }
             y += ROW;
             f.label(rect(lx, y, col_width, H), "Mode");
-            match self.config.output.confirmed_mode.clone() {
+            match self.config.input_mode_confirmation().cloned() {
                 Some(c) => {
                     f.value(
                         rect(fx, y, col_width, H),
@@ -339,17 +496,30 @@ impl App {
                         &mut self.mode_ack,
                         "Checked on SLM",
                     );
+                    let target = self
+                        .config
+                        .output
+                        .display
+                        .as_ref()
+                        .filter(|d| !d.monitor_device_path.is_empty());
                     let ok = self.mode_ack
                         && self.mode_choice.supported()
-                        && !self.mode_note.trim().is_empty();
+                        && !self.mode_note.trim().is_empty()
+                        && target.is_some();
                     if f.button_with(
                         rect(action_x, y, col_width, H),
                         "Confirm",
                         ok,
                         Tone::Neutral,
-                        Some("Record the verified input mode (60 Hz, Table 6)"),
-                    ) {
+                        Some(if target.is_some() {
+                            "Record the verified input mode (60 Hz, Table 6)"
+                        } else {
+                            "Select the SLM display first"
+                        }),
+                    ) && let Some(target) = target
+                    {
                         self.config.output.confirmed_mode = Some(ModeConfirmation {
+                            monitor_device_path: target.monitor_device_path.clone(),
                             mode: self.mode_choice,
                             confirmed_unix_s: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -444,6 +614,10 @@ impl App {
                 format!("Output display: {} (nothing sent).", selection.label()),
             );
             self.config.output.display = Some(selection);
+            if self.config.input_mode_confirmation().is_none() {
+                self.config.output.confirmed_mode = None;
+                self.mode_ack = false;
+            }
             self.save_config();
         }
         if f.button_with(
@@ -528,6 +702,9 @@ impl App {
         }
         if settings {
             self.settings_open = !self.settings_open;
+            if !self.settings_open {
+                self.settings_draft = None;
+            }
         }
         if reset {
             self.reset_pattern();
@@ -564,22 +741,58 @@ impl App {
 
     fn device_settings_window(&mut self, ctx: &egui::Context, origin: Pos2) {
         let mut open = true;
-        let width = 352.;
+        let mut accept = false;
+        let mut cancel = false;
+        let width = 380.;
+        let actual = self.config.profile.clone();
+        let dirty = self.config_dirty;
+        let mut draft = self.settings_draft.take().unwrap_or_else(|| actual.clone());
+        draft.device_wavelength_nm = actual.device_wavelength_nm;
+        draft.device_phase_raw = actual.device_phase_raw;
+        self.config.profile = draft;
         egui::Window::new("Device Settings")
             .id(egui::Id::new("device-settings-window"))
-            .default_pos(origin)
+            .default_pos(Pos2::new(origin.x, 60.))
             .default_width(width)
             .resizable(false)
             .collapsible(false)
-            .vscroll(true)
             .open(&mut open)
             .show(ctx, |ui| {
-                let start = ui.available_rect_before_wrap().min;
-                let mut form = Form::new(ui, start);
-                let used = self.settings_rows(&mut form, width, 4.);
-                ui.set_min_size(Vec2::new(width, used));
+                egui::ScrollArea::vertical()
+                    .max_height((ctx.content_rect().height() - 220.).max(150.))
+                    .show(ui, |ui| {
+                        let start = ui.available_rect_before_wrap().min;
+                        let mut form = Form::new(ui, start);
+                        let used = self.settings_rows(&mut form, width, 4.);
+                        ui.set_min_size(Vec2::new(width, used));
+                    });
+                ui.label("USB Read/Write and Copy center act immediately.");
+                ui.horizontal(|ui| {
+                    accept = ui
+                        .add_enabled(
+                            !self.device_busy() && self.config.profile.validate().is_ok(),
+                            egui::Button::new("Use Settings"),
+                        )
+                        .clicked();
+                    cancel = ui.button("Cancel Settings").clicked();
+                });
             });
-        self.settings_open = open;
+        let draft = self.config.profile.clone();
+        let hardware_changed = actual.device_wavelength_nm != draft.device_wavelength_nm
+            || actual.device_phase_raw != draft.device_phase_raw;
+        self.config.profile = actual;
+        self.config.profile.device_wavelength_nm = draft.device_wavelength_nm;
+        self.config.profile.device_phase_raw = draft.device_phase_raw;
+        self.config_dirty = dirty || hardware_changed;
+        if accept {
+            self.config_dirty |= self.config.profile != draft;
+            self.config.profile = draft;
+            self.settings_open = false;
+        } else if !open || cancel {
+            self.settings_open = false;
+        } else {
+            self.settings_draft = Some(draft);
+        }
     }
 
     fn settings_rows(&mut self, f: &mut Form, w: f32, mut y: f32) -> f32 {
@@ -590,7 +803,7 @@ impl App {
             if locked {
                 "Disconnect to edit · saved by Config Save"
             } else {
-                "Saved by Config Save"
+                "Use Settings, then Config Save to persist"
             },
             MUTED,
         );
@@ -618,18 +831,41 @@ impl App {
                 p.generation.optics.magnification = 1. / demag;
             }
         });
-        row(f, "phase0", "code", &mut y, &mut |f, r| {
-            f.number("phase0", r, &mut p.generation.calibration.phase0, true);
-        });
-        row(f, "Code period", "codes / 2π", &mut y, &mut |f, r| {
-            f.integer(
-                "code-period",
-                r,
-                &mut p.generation.calibration.code_period,
-                1.,
-                1024.,
-            );
-        });
+        use slm_core::PhaseMapping;
+        let calibration = &mut p.generation.calibration;
+        f.label(rect(lx, y, fx - lx - 6., H), "Phase mapping");
+        f.combo(
+            "phase-mapping",
+            rect(fx, y, w - fx - 11., H),
+            &mut calibration.mapping,
+            &[
+                (
+                    PhaseMapping::SantecFullScale,
+                    "Santec full scale (2π)".into(),
+                    true,
+                ),
+                (PhaseMapping::Notebook, "Notebook calibration".into(), true),
+            ],
+        );
+        y += ROW;
+        match calibration.mapping {
+            PhaseMapping::Notebook => {
+                row(f, "phase0", "code", &mut y, &mut |f, r| {
+                    f.number("phase0", r, &mut calibration.phase0, true);
+                });
+                row(f, "Code period", "codes / 2π", &mut y, &mut |f, r| {
+                    f.integer("code-period", r, &mut calibration.code_period, 1., 1024.);
+                });
+            }
+            PhaseMapping::SantecFullScale => {
+                f.note(
+                    rect(lx, y, w - lx - 11., H),
+                    "Set a 2π phase range in the Santec software.",
+                    MUTED,
+                );
+                y += ROW;
+            }
+        }
         row(f, "Mount angle", "°", &mut y, &mut |f, r| {
             f.number("mount", r, &mut p.generation.mount_angle_deg, true);
         });
@@ -646,7 +882,7 @@ impl App {
                 10_000.,
             );
         });
-        row(f, "Center X / Y", "px", &mut y, &mut |f, r| {
+        row(f, "Default center", "px", &mut y, &mut |f, r| {
             let half = (r.width() - 4.) / 2.;
             let mut cx = p.default_center_offset_px[0];
             let mut cy = p.default_center_offset_px[1];
@@ -666,6 +902,15 @@ impl App {
             );
             p.default_center_offset_px = [cx, cy];
         });
+        if f.button(
+            rect(lx, y, w - lx - 11., H),
+            "Copy default center to forms",
+            !locked,
+        ) {
+            self.single.geometry.center_offset_px = p.default_center_offset_px;
+            self.multi.geometry.center_offset_px = p.default_center_offset_px;
+        }
+        y += ROW;
         f.label(rect(lx, y, fx - lx - 6., H), "Note");
         f.text(
             "calibration-note",
@@ -689,15 +934,23 @@ impl App {
         let simulated = self.config.output.backend == BackendKind::Demo;
         f.enabled = !locked;
         f.label(rect(20., y, 89., H), "Wavelength");
-        f.text("wavelength", rect(114., y, 86., H), &mut self.wavelength_nm);
+        if f.text("wavelength", rect(114., y, 86., H), &mut self.wavelength_nm)
+            .changed()
+        {
+            self.wavelength_status = None;
+        }
         f.muted(rect(206., y, 22., H), "nm");
         if !simulated {
             f.label(rect(232., y, 46., H), "USB #");
-            f.text(
+            if f.text(
                 "wavelength-device",
                 rect(279., y, w - 290., H),
                 &mut self.wavelength_usb_device,
-            );
+            )
+            .changed()
+            {
+                self.wavelength_status = None;
+            }
         }
         y += ROW;
         let half = (w - 28.) / 2.;
@@ -710,7 +963,7 @@ impl App {
             device_ok && valid,
             Tone::Primary,
             Some(if valid {
-                "Write to the selected USB device and verify by readback"
+                "Write wavelength, preserve the current phase range, and verify by readback"
             } else {
                 "Enter an integer from 450 to 1600 nm"
             }),
@@ -903,7 +1156,7 @@ impl App {
             if f.button_with(
                 rect(px, save_y, bw, H),
                 label,
-                can_save,
+                can_save && self.export_job.is_none(),
                 Tone::Neutral,
                 Some("Save the current Input Pattern"),
             ) {
@@ -1352,7 +1605,7 @@ impl App {
     }
 
     fn pick_save_path(&self) -> Option<PathBuf> {
-        rfd::FileDialog::new()
+        self.file_dialog("Save list")
             .add_filter("KohdaLab SLM experiment", &["json"])
             .set_file_name(format!("{}.json", self.experiment.experiment.name))
             .save_file()
@@ -1366,11 +1619,15 @@ impl App {
             .map_or_else(|| "Not saved".to_string(), |p| p.display().to_string());
         let mut f = Form::new(ui, origin);
         f.label(rect(9., 9., 66., H), "Name");
-        f.text(
+        if f.text(
             "experiment-name",
             rect(81., 9., 200., H),
             &mut self.experiment.experiment.name,
-        );
+        )
+        .changed()
+        {
+            self.experiment.dirty = true;
+        }
         if self.experiment.dirty {
             f.value(rect(289., 9., 80., H), "unsaved", AMBER);
         }
@@ -1388,7 +1645,7 @@ impl App {
         let export = f.button(
             rect(81. + bw + 6., 105., bw, H),
             "Export…",
-            !self.experiment.experiment.items.is_empty(),
+            !self.experiment.experiment.items.is_empty() && self.export_job.is_none(),
         );
         f.label(rect(9., 137., 66., H), "PNG");
         let mut x = 81.;
@@ -1406,6 +1663,25 @@ impl App {
                 }
             }
             x += width + 6.;
+        }
+        if let Some((done, total)) = self.export_progress {
+            f.value(
+                rect(81. + 2. * (bw + 6.), 105., 140., H),
+                if self.export_job.as_ref().is_some_and(|j| j.cancellable) {
+                    format!("Exporting {done}/{total}")
+                } else {
+                    "Saving file…".into()
+                },
+                TEAL,
+            );
+            if f.button(
+                rect(81. + 2. * (bw + 6.) + 144., 105., 110., H),
+                "Cancel Export",
+                self.export_job.as_ref().is_some_and(|j| j.cancellable),
+            ) && let Some(job) = &self.export_job
+            {
+                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         let mut discard = None;
         if let Some(action) = self.confirm_discard {
@@ -1442,7 +1718,8 @@ impl App {
                 self.confirm_discard = Some(Discard::Open)
             }
             Some("Open List…") => {
-                if let Some(p) = rfd::FileDialog::new()
+                if let Some(p) = self
+                    .file_dialog("Open list")
                     .add_filter("KohdaLab SLM experiment", &["json"])
                     .pick_file()
                 {
@@ -1475,7 +1752,8 @@ impl App {
                     self.reveal_row = None;
                 }
                 Discard::Open => {
-                    if let Some(p) = rfd::FileDialog::new()
+                    if let Some(p) = self
+                        .file_dialog("Open list")
                         .add_filter("KohdaLab SLM experiment", &["json"])
                         .pick_file()
                     {
@@ -1485,7 +1763,8 @@ impl App {
             }
         }
         if import
-            && let Some(files) = rfd::FileDialog::new()
+            && let Some(files) = self
+                .file_dialog("Import CSV")
                 .add_filter("Santec CSV", &["csv"])
                 .pick_files()
         {
@@ -1493,8 +1772,9 @@ impl App {
                 self.import_csv(&file);
             }
         }
-        if export && let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            self.export_experiment(&dir);
+        if export && let Some(dir) = self.file_dialog("Export folder").pick_folder() {
+            self.dialog_dirs.insert("Export folder".into(), dir.clone());
+            self.export_experiment(&dir.join(format!("slm-export-{}", new_id())));
         }
     }
 
@@ -1502,12 +1782,22 @@ impl App {
 
     fn pattern_label(item: &ExperimentItem) -> String {
         item.sweep.as_ref().map_or_else(
-            || item.label.clone(),
+            || {
+                if matches!(item.label.as_str(), "Single Wave" | "Multi-Wave") {
+                    format!("{} · {}", item.label, item.summary())
+                } else {
+                    item.label.clone()
+                }
+            },
             |sweep| {
                 let unit = ui_text(&sweep.unit);
-                format!("{} {unit}", format_number(sweep.value))
-                    .trim_end()
-                    .into()
+                format!(
+                    "{} = {} {unit}",
+                    sweep.target_label,
+                    format_number(sweep.value)
+                )
+                .trim_end()
+                .into()
             },
         )
     }
@@ -1582,6 +1872,7 @@ impl App {
         let block = self.apply_block();
         let mut apply = None;
         let remove;
+        let mut undo = false;
         {
             let mut f = Form::new(ui, origin);
             f.group(rect(0., 0., w, height), "Patterns");
@@ -1625,7 +1916,7 @@ impl App {
                 "Apply Row",
                 block.is_none() && self.selected.is_some(),
                 Tone::Primary,
-                Some(block.unwrap_or("Apply the focused list row")),
+                Some(block.unwrap_or("Apply the focused list row · Ctrl/Cmd+Enter")),
             ) {
                 apply = self.selected;
             }
@@ -1638,7 +1929,7 @@ impl App {
             }
 
             let footer = height - 34.;
-            let half = (w - 28.) / 2.;
+            let half = (w - 34.) / 3.;
             remove = f.button_with(
                 rect(11., footer, half, 24.),
                 "Remove Selected",
@@ -1646,7 +1937,20 @@ impl App {
                 Tone::Neutral,
                 Some("Remove selected rows from the list"),
             );
-            if f.button(rect(17. + half, footer, half, 24.), "Remove All…", n > 0) {
+            if f.button(
+                rect(17. + half, footer, half, 24.),
+                "Undo Remove",
+                self.undo_removed
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &self.experiment.experiment.id),
+            ) {
+                undo = true;
+            }
+            if f.button(
+                rect(23. + 2. * half, footer, half, 24.),
+                "Remove All…",
+                n > 0,
+            ) {
                 self.confirm_remove_all = true;
             }
         }
@@ -1881,6 +2185,9 @@ impl App {
             keyboard.request_focus();
             ui.memory_mut(lock_arrows);
         }
+        if undo {
+            self.undo_remove();
+        }
         if remove {
             self.remove_rows(false);
         }
@@ -1908,7 +2215,8 @@ impl App {
 
     /// Lower center: the SLM code heatmap of the current input, as TRKR's
     /// plot area. Image +X is right (column 0 left), +Y is down (row 0 top),
-    /// square SLM pixels, color scale 0 … profile max code.
+    /// square SLM pixels, fixed color scale 0 … profile max code in the
+    /// selected colormap, with a matching colorbar on the right.
     fn input_pattern(&mut self, ui: &mut egui::Ui, area: Rect) {
         let current = self.current_preview();
         let mut use_row = self.sweep_preview_row;
@@ -1919,6 +2227,23 @@ impl App {
                 .as_ref()
                 .map_or_else(|| "No list row selected".to_string(), |(_, _, c)| c.clone());
             let mut caption_w = area.width() - 98.;
+            // Compact colormap selector at the right end of the header.
+            const MAP_W: f32 = 104.;
+            caption_w -= MAP_W + 6.;
+            let mut colormap = self.config.preview_colormap;
+            let options: Vec<(Colormap, String, bool)> = Colormap::ALL
+                .into_iter()
+                .map(|m| (m, m.label().to_string(), true))
+                .collect();
+            if f.combo(
+                "preview-colormap",
+                rect(area.width() - MAP_W, 0., MAP_W, 24.),
+                &mut colormap,
+                &options,
+            ) {
+                self.config.preview_colormap = colormap;
+                self.config_dirty = true;
+            }
             if self.tab == Tab::Sweep {
                 caption_w -= 186.;
                 let x = 98. + caption_w + 6.;
@@ -1981,7 +2306,7 @@ impl App {
         };
         // Fit the SLM raster with square pixels, centered in the frame with
         // room for tick labels on the left and below.
-        let (left, right, top, bottom) = (72., 24., 22., 46.);
+        let (left, right, top, bottom) = (72., 78., 22., 46.);
         let avail = Vec2::new(frame.width() - left - right, frame.height() - top - bottom);
         let aspect = info.width as f32 / info.height.max(1) as f32;
         let (mut iw, mut ih) = (avail.x, avail.x / aspect);
@@ -2010,6 +2335,7 @@ impl App {
         let unit = axes.unit.label();
         let small = egui::FontId::proportional(11.);
         let tick_stroke = egui::Stroke::new(1_f32, MUTED);
+        self.colorbar(&painter, image, info, &small, tick_stroke);
         // Screen position of a coordinate: pixel centers, +X right, +Y down,
         // origin at the exact image center.
         let sx = |c: f64| image.min.x + axes.fraction(0, c) as f32 * image.width();
@@ -2093,7 +2419,7 @@ impl App {
         }
         ui.interact(image, egui::Id::new("input-pattern-hover"), egui::Sense::hover())
             .on_hover_text(format!(
-                "{} × {} px · origin (0, 0) at the image center, pixel ({:.1}, {:.1}) · {} per px\ncodes in use {}–{}, color scale 0–{} (profile max)\nframe sha256 {}…\nPreview only: identical to what Apply would send, but nothing is sent.",
+                "{} × {} px · origin (0, 0) at the image center, pixel ({:.1}, {:.1}) · {} per px\ncodes in use {}–{}, color scale 0–{} (profile max), {}\nframe sha256 {}…\nPreview only: identical to what Apply would send, but nothing is sent.",
                 info.width,
                 info.height,
                 axes.origin_px[0],
@@ -2106,8 +2432,76 @@ impl App {
                 info.min_code,
                 info.max_code_used,
                 info.scale_max,
+                info.colormap.label(),
                 info.digest.get(..16).unwrap_or(&info.digest),
             ));
+    }
+
+    /// Vertical colorbar right of the image: code 0 at the bottom, the
+    /// profile max code at the top, in the colormap the image was drawn with.
+    /// Uses the same `Colormap::rgb(code / max)` as the image pixels.
+    fn colorbar(
+        &self,
+        painter: &egui::Painter,
+        image: Rect,
+        info: &crate::preview::PreviewImage,
+        font: &egui::FontId,
+        tick_stroke: egui::Stroke,
+    ) {
+        let bar = Rect::from_min_max(
+            Pos2::new(image.max.x + 12., image.min.y),
+            Pos2::new(image.max.x + 24., image.max.y),
+        );
+        let max = f64::from(info.scale_max.max(1));
+        let strips = (bar.height().round() as usize).clamp(1, 256);
+        let strip_h = bar.height() / strips as f32;
+        for i in 0..strips {
+            // Strip i covers codes from the top down; color at its center.
+            let t = 1. - (i as f64 + 0.5) / strips as f64;
+            let [r, g, b] = info.colormap.rgb(t);
+            let y = bar.min.y + i as f32 * strip_h;
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(bar.min.x, y),
+                    Pos2::new(bar.max.x, y + strip_h + 0.5),
+                ),
+                0.,
+                Color32::from_rgb(r, g, b),
+            );
+        }
+        painter.rect_stroke(
+            bar,
+            0.,
+            egui::Stroke::new(1_f32, BORDER),
+            egui::StrokeKind::Outside,
+        );
+        let (ticks, step) = crate::preview::nice_ticks(0., max, 5);
+        let mut values: Vec<f64> = ticks
+            .into_iter()
+            .filter(|t| *t < max - step * 0.35)
+            .collect();
+        values.push(max);
+        for v in values {
+            let y = bar.max.y - (v / max) as f32 * bar.height();
+            painter.line_segment(
+                [Pos2::new(bar.max.x, y), Pos2::new(bar.max.x + 4., y)],
+                tick_stroke,
+            );
+            painter.text(
+                Pos2::new(bar.max.x + 6., y),
+                egui::Align2::LEFT_CENTER,
+                crate::preview::tick_label(v, 1.),
+                font.clone(),
+                MUTED,
+            );
+        }
+        painter.text(
+            Pos2::new(bar.center().x, bar.max.y + 7.),
+            egui::Align2::CENTER_TOP,
+            "code",
+            font.clone(),
+            TEXT,
+        );
     }
 
     // ----- right rail ----------------------------------------------------
@@ -2123,8 +2517,9 @@ impl App {
         let inner = area.shrink(4.);
         // Status line and log body are separate rectangles; the body is
         // clipped to its own rect so scrolled lines never cover the status.
-        let status_h = if self.demo { 20. } else { 0. };
-        if self.demo {
+        let simulated = self.config.output.backend == BackendKind::Demo;
+        let status_h = if simulated { 20. } else { 0. };
+        if simulated {
             let status = rect(inner.min.x + 2., inner.min.y, inner.width() - 4., status_h);
             ui.painter().with_clip_rect(status).text(
                 Pos2::new(status.min.x, status.center().y),

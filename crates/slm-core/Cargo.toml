@@ -11,6 +11,6 @@ serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 image.workspace = true
-
-[dev-dependencies]
+colorous.workspace = true
 tempfile.workspace = true
+

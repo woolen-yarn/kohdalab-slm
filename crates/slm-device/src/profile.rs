@@ -31,12 +31,22 @@ pub struct DeviceProfile {
     /// Wavelength set on the device, as recorded by the user [nm].
     #[serde(default)]
     pub device_wavelength_nm: Option<f64>,
+    /// SDK raw maximum-phase readback; units must be verified against the SDK.
+    #[serde(default)]
+    pub device_phase_raw: Option<u32>,
     /// Free-text record of the generator calibration and where it came from.
     #[serde(default)]
     pub calibration_note: String,
 }
 
 impl DeviceProfile {
+    pub fn santec_slm200() -> Self {
+        let mut profile = Self::santec_slm200_candidate();
+        profile.generation.calibration.mapping = slm_core::PhaseMapping::SantecFullScale;
+        profile.calibration_note = String::new();
+        profile
+    }
+
     /// Notebook candidate: 1920 × 1200, 8 µm, 1/75, center (−16, 110),
     /// phase0 = 136, period = 888.
     pub fn santec_slm200_candidate() -> Self {
@@ -53,6 +63,7 @@ impl DeviceProfile {
                     magnification: 1. / 75.,
                 },
                 calibration: PhaseCalibration {
+                    mapping: Default::default(),
                     phase0: 136.,
                     code_period: 888,
                 },
@@ -62,6 +73,7 @@ impl DeviceProfile {
             default_center_offset_px: [-16, 110],
             reset_code: 0,
             device_wavelength_nm: None,
+            device_phase_raw: None,
             calibration_note: "Notebook candidate (phase0 136, period 888); not yet compared with the vendor software"
                 .into(),
         }
@@ -69,6 +81,9 @@ impl DeviceProfile {
 
     pub fn validate(&self) -> Result<(), String> {
         self.generation.validate()?;
+        if self.generation.max_code != 1023 {
+            return Err("Santec SLM-200 requires the 10-bit code range 0–1023".into());
+        }
         if self.reset_code > self.generation.max_code {
             return Err(format!(
                 "Reset code {} is outside 0–{}",

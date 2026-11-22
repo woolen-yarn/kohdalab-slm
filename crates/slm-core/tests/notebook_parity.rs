@@ -23,6 +23,7 @@ fn profile(width: u32, height: u32) -> GenerationProfile {
             magnification: 1. / 75.,
         },
         calibration: PhaseCalibration {
+            mapping: Default::default(),
             phase0: 136.,
             code_period: 888,
         },

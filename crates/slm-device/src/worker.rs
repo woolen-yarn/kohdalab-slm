@@ -14,8 +14,9 @@ use crate::demo::{DemoBackend, DemoControl};
 use crate::display::{DisplayInfo, DisplaySelection, OutputRequirements, check_output, describe};
 use crate::encoding::{InputMode, encode_bgrx};
 use crate::profile::DeviceProfile;
-use slm_core::experiment::{ExperimentItem, render_item};
-use slm_core::{CodeFrame, GenerationProfile, PatternSpec};
+use crate::wavelength::WavelengthReading;
+use slm_core::experiment::{ExperimentItem, ItemSource, render_item};
+use slm_core::{CodeFrame, GenerationProfile, PatternSpec, PhaseMapping};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -128,7 +129,7 @@ pub enum Event {
         /// `false` when the failure left the SLM output unknown.
         output_known: bool,
     },
-    Wavelength(Result<u32, String>),
+    Wavelength(Result<WavelengthReading, String>),
     Log(String),
 }
 
@@ -376,7 +377,12 @@ impl Worker {
                 output_known,
             });
         };
-        if !self.state.is_connected() || self.session.is_none() {
+        let active = self
+            .session
+            .as_ref()
+            .filter(|_| self.state.is_connected())
+            .map(|session| &session.profile.generation);
+        let Some(active) = active else {
             let reason = match &self.state {
                 DeviceState::Unknown { .. } => {
                     "Output state is unknown; disconnect, reselect and reconnect first"
@@ -387,6 +393,28 @@ impl Worker {
                 self,
                 reason.into(),
                 !matches!(self.state, DeviceState::Unknown { .. }),
+            );
+            return;
+        };
+        let generated = match &item.source {
+            FrameSource::Generate { spec, profile } => Some((spec, profile)),
+            FrameSource::Experiment { item, .. } => match &item.source {
+                ItemSource::Generated { spec } => Some((spec, &item.profile)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((spec, profile)) = generated
+            && !matches!(spec, PatternSpec::Uniform { .. })
+            && (profile.max_code != active.max_code
+                || profile.calibration.mapping != active.calibration.mapping
+                || (active.calibration.mapping == PhaseMapping::Notebook
+                    && profile.calibration != active.calibration))
+        {
+            fail(
+                self,
+                "Not sent (previous pattern still shown): pattern phase mapping differs from the connected profile. Reconnect with a matching profile or add a new pattern.".into(),
+                true,
             );
             return;
         }
@@ -476,15 +504,19 @@ impl Worker {
     }
 
     /// Reset (when the output is trusted), then close.
-    fn disconnect(&mut self) -> String {
+    fn disconnect(&mut self) -> Result<String, String> {
+        let mut failed = false;
         let summary = match &self.session {
             None => {
                 let was_unknown = matches!(self.state, DeviceState::Unknown { .. });
                 self.set_state(DeviceState::Disconnected);
                 return if was_unknown {
-                    "Disconnected. The SLM output state was unknown and is still unverified.".into()
+                    Err(
+                        "Disconnected. The SLM output state was unknown and is still unverified."
+                            .into(),
+                    )
                 } else {
-                    "Already disconnected.".into()
+                    Ok("Already disconnected.".into())
                 };
             }
             Some(session) => {
@@ -495,20 +527,28 @@ impl Worker {
                             "Reset pattern code {} sent before closing.",
                             profile.reset_code
                         ),
-                        Err(e) => format!("Reset before closing failed: {e}."),
+                        Err(e) => {
+                            failed = true;
+                            format!("Reset before closing failed: {e}.")
+                        }
                     }
                 } else {
+                    failed = true;
                     "Output state was unknown; no reset was sent.".into()
                 }
             }
         };
+        let mut summary = summary;
         if let Some(mut session) = self.session.take()
             && let Err(e) = session.backend.close()
         {
-            self.log(format!("Close output: {e}"));
+            failed = true;
+            summary.push_str(&format!(" Close output failed: {e}."));
         }
         self.set_state(DeviceState::Disconnected);
-        format!("{summary} Output closed; what the SLM shows after closing is not verified.")
+        summary
+            .push_str(" Output session ended; what the SLM shows after closing is not verified.");
+        if failed { Err(summary) } else { Ok(summary) }
     }
 
     fn poll(&mut self) {
@@ -546,11 +586,11 @@ impl Worker {
                 }
                 Ok(Command::Disconnect { .. }) => {
                     let summary = self.disconnect();
-                    self.log(summary);
+                    self.log(summary.unwrap_or_else(|e| e));
                 }
                 Ok(Command::Shutdown { reply }) => {
                     let summary = self.disconnect();
-                    let _ = reply.send(Ok(summary));
+                    let _ = reply.send(summary);
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -568,7 +608,7 @@ impl Worker {
         backend: BackendKind,
         usb_device: u32,
         requested_nm: Option<u32>,
-    ) -> Result<u32, String> {
+    ) -> Result<WavelengthReading, String> {
         if !matches!(self.state, DeviceState::Disconnected) {
             return Err("Disconnect video output before changing the wavelength".into());
         }
@@ -582,7 +622,10 @@ impl Worker {
                 if let Some(nm) = requested_nm {
                     self.demo_wavelength_nm = nm;
                 }
-                Ok(self.demo_wavelength_nm)
+                Ok(WavelengthReading {
+                    nm: self.demo_wavelength_nm,
+                    phase_bits: None,
+                })
             }
             BackendKind::WindowsDisplay => {
                 crate::wavelength::santec_wavelength(usb_device, requested_nm)
@@ -769,6 +812,22 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_phase_mapping_leaves_the_previous_output() {
+        let mut r = rig();
+        assert!(r.connect(Some(InputMode::Hz60)).is_connected());
+        let FrameSource::Generate { spec, mut profile } = wave_spec() else {
+            unreachable!();
+        };
+        profile.calibration.mapping = PhaseMapping::SantecFullScale;
+        let item = ExperimentItem::generated("different phase mapping".into(), spec, profile);
+        let event = r.apply(FrameSource::Experiment { item, asset: None });
+        assert!(
+            matches!(event, Event::ApplyFailed { output_known: true, error, .. } if error.contains("phase mapping"))
+        );
+        assert_eq!(r.demo.lock().shows, 1);
+    }
+
+    #[test]
     fn unsupported_120hz_sends_nothing() {
         let r = rig();
         assert_eq!(r.connect(Some(InputMode::Hz120)), DeviceState::Disconnected);
@@ -907,6 +966,15 @@ mod tests {
             .unwrap();
         assert_eq!(r.state(), DeviceState::Disconnected);
         assert_eq!(r.demo.lock().shows, 0);
+    }
+
+    #[test]
+    fn shutdown_reports_reset_failure() {
+        let mut r = rig();
+        assert!(r.connect(Some(InputMode::Hz60)).is_connected());
+        r.demo.lock().fail_next_show = Some("reset rejected".into());
+        let error = r.worker.shutdown(Duration::from_secs(10)).unwrap_err();
+        assert!(error.contains("reset rejected"), "{error}");
     }
 
     #[test]

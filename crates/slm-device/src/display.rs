@@ -63,6 +63,10 @@ pub struct DisplayInfo {
     pub rotated: bool,
     /// HDR / advanced color; `None` when Windows did not report it.
     pub advanced_color: Option<bool>,
+    #[serde(default)]
+    pub rgb_output: Option<bool>,
+    #[serde(default)]
+    pub bits_per_channel: Option<u32>,
     /// Shown in the GUI; demo displays are never physical outputs.
     #[serde(default)]
     pub simulated: bool,
@@ -179,6 +183,9 @@ pub enum BlockReason {
     },
     BitDepth(Option<u32>),
     AdvancedColor,
+    NonRgbOutput,
+    OutputBitDepth(u32),
+    UnknownDisplayProperty(&'static str),
 }
 
 impl std::fmt::Display for BlockReason {
@@ -266,6 +273,20 @@ impl std::fmt::Display for BlockReason {
                 ),
                 None => write!(f, "Windows did not report the desktop color depth."),
             },
+            BlockReason::NonRgbOutput => write!(
+                f,
+                "The display output is not RGB. Select 8-bit RGB in the graphics settings."
+            ),
+            BlockReason::OutputBitDepth(bits) => write!(
+                f,
+                "The display output is {bits} bits per channel; select 8-bit RGB in the graphics settings."
+            ),
+            BlockReason::UnknownDisplayProperty(property) => {
+                write!(
+                    f,
+                    "Windows did not report {property}; exact SLM output cannot be verified."
+                )
+            }
             BlockReason::AdvancedColor => write!(
                 f,
                 "HDR / advanced color is on for this display; pixel values would be remapped. Turn HDR off."
@@ -367,6 +388,33 @@ pub fn check_output(
     if display.advanced_color == Some(true) {
         reasons.push(BlockReason::AdvancedColor);
     }
+    if display.rgb_output == Some(false) {
+        reasons.push(BlockReason::NonRgbOutput);
+    }
+    if let Some(bits) = display.bits_per_channel
+        && bits != 8
+    {
+        reasons.push(BlockReason::OutputBitDepth(bits));
+    }
+    if !display.simulated {
+        for (known, property) in [
+            (display.monitor_rect.is_some(), "the monitor bounds"),
+            (display.rgb_output.is_some(), "the output color format"),
+            (display.bits_per_channel.is_some(), "the output color depth"),
+            (
+                display.signal_active.is_some(),
+                "the active video resolution",
+            ),
+            (
+                display.advanced_color.is_some(),
+                "the HDR / advanced color state",
+            ),
+        ] {
+            if !known {
+                reasons.push(BlockReason::UnknownDisplayProperty(property));
+            }
+        }
+    }
     if reasons.is_empty() {
         Ok(display.clone())
     } else {
@@ -405,6 +453,8 @@ pub(crate) mod tests {
             clone_count: 1,
             rotated: false,
             advanced_color: Some(false),
+            rgb_output: Some(true),
+            bits_per_channel: Some(8),
             simulated: false,
         }
     }
@@ -415,6 +465,21 @@ pub(crate) mod tests {
             height: 1200,
             mode: Some(InputMode::Hz60),
         }
+    }
+
+    #[test]
+    fn real_output_requires_reported_properties_and_eight_bit_rgb() {
+        let mut display = slm(r"\.\DISPLAY2", 1920);
+        let selection = display.selection();
+        display.signal_active = None;
+        display.rgb_output = Some(false);
+        display.bits_per_channel = Some(10);
+        let reasons = check_output(Some(&selection), &[display], &req(), false).unwrap_err();
+        assert!(reasons.contains(&BlockReason::UnknownDisplayProperty(
+            "the active video resolution"
+        )));
+        assert!(reasons.contains(&BlockReason::NonRgbOutput));
+        assert!(reasons.contains(&BlockReason::OutputBitDepth(10)));
     }
 
     #[test]

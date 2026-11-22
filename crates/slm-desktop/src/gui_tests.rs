@@ -104,7 +104,14 @@ fn demo_connect_apply_and_step_through_sweep() {
     h.get_by_label("Add Sweep").click();
     h.run_steps(1);
     assert_eq!(h.state().experiment.experiment.items.len(), 3);
-    for expected in [0u16, 10, 20] {
+    assert_eq!(h.state().selected, Some(0));
+    assert_eq!(last_code(&h), Some(512), "adding sweep does not apply");
+    h.get_by_label("Apply Row").click();
+    until(&mut h, "first sweep row", |a| {
+        a.pending.is_none() && a.showing_index() == Some(0)
+    });
+    assert_eq!(last_code(&h), Some(0));
+    for expected in [10u16, 20] {
         h.get_by_label("Next").click();
         until(&mut h, "next applied", |a| {
             a.pending.is_none() && matches!(a.status, ApplyStatus::Applied(..))
@@ -125,12 +132,12 @@ fn demo_connect_apply_and_step_through_sweep() {
     // Experiment tab: selecting a specific row sends only on Apply Row.
     h.get_by_label("Experiment").click();
     h.run_steps(2);
-    h.get_by_label("#1 0 code").click();
+    h.get_by_label("#1 Contrast level [code] = 0 code").click();
     h.run_steps(2);
     assert_eq!(last_code(&h), Some(10));
-    h.get_by_label("Selected · Row #1 · 0 code");
-    h.get_by_label("Applied · Row #2 · 10 code");
-    h.get_by_label("Save target · Row #1 · 0 code");
+    h.get_by_label("Selected · Row #1 · Contrast level [code] = 0 code");
+    h.get_by_label("Applied · Row #2 · Contrast level [code] = 10 code");
+    h.get_by_label("Save target · Row #1 · Contrast level [code] = 0 code");
     h.get_by_label("Apply Row").click();
     until(&mut h, "selected applied", |a| {
         a.pending.is_none() && a.showing_index() == Some(0)
@@ -346,6 +353,32 @@ fn wavelength_demo_reads_and_writes_calibration() {
 }
 
 #[test]
+fn loading_a_config_replaces_wavelength_input_and_clears_simulated_readback() {
+    let mut h = harness(false);
+    let mut config = h.state().config.clone();
+    config.output.backend = slm_device::backend::BackendKind::Demo;
+    config.profile.device_wavelength_nm = Some(830.);
+    let path = h.state().config_path.clone();
+    config.save(&path).unwrap();
+    h.get_by_label("Load").click();
+    h.get_by_label("Settings").click();
+    h.run_steps(3);
+    assert!(h.get_all_by_value("830").next().is_some());
+    h.get_by_label("Read Wavelength").click();
+    until(&mut h, "simulated wavelength read", |a| {
+        a.log
+            .iter()
+            .any(|line| line.text == "Simulated readback: 795 nm")
+    });
+    assert_eq!(h.state().config.profile.device_wavelength_nm, Some(830.));
+    assert!(h.get_all_by_value("830").next().is_some());
+    h.get_by_label("Load").click();
+    h.run_steps(3);
+    assert!(h.get_all_by_value("830").next().is_some());
+    h.get_by_label("Simulated USB calibration");
+}
+
+#[test]
 fn side_columns_collapse_with_edge_toggles() {
     let mut h = harness(true);
     h.run_steps(2);
@@ -373,7 +406,7 @@ fn input_pattern_preview_matches_input_and_never_sends() {
     h.get_by_label("Connect").click();
     until(&mut h, "connected", |a| a.connected());
     let sent_before = shows(&h);
-    let profile = slm_device::DeviceProfile::santec_slm200_candidate().generation;
+    let profile = h.state().config.profile.generation;
 
     // Uniform: preview digest equals the frame Apply would send.
     h.state_mut().uniform_code = 300;
@@ -429,7 +462,7 @@ fn input_pattern_preview_matches_input_and_never_sends() {
     h.run_steps(2);
     wait_preview(&mut h);
     h.get_by_label_contains("List row #3");
-    h.get_by_label("Save target · Row #3 · 20 code");
+    h.get_by_label("Save target · Row #3 · Contrast level [code] = 20 code");
     assert_eq!(h.state().preview.info.as_ref().unwrap().max_code_used, 20);
 
     // Experiment: the selected row.
@@ -466,7 +499,7 @@ fn settings_window_keeps_the_patterns_list_visible() {
     h.run_steps(2);
     assert!(h.state().settings_open);
     assert_eq!(h.get_by_label("Remove All…").rect(), list_before);
-    h.get_by_label_contains("Saved by Config Save");
+    h.get_by_label_contains("Use Settings, then Config Save");
     // Connecting keeps the section open but locks it.
     h.get_by_label("Connect").click();
     until(&mut h, "connected", |a| a.connected());
@@ -530,4 +563,425 @@ fn startup_fit_folds_panels_and_caps_the_minimum() {
     h.run_steps(2);
     assert!(!h.state().left_collapsed && h.state().right_collapsed);
     h.get_by_label("Connect");
+}
+
+fn pick_colormap(h: &mut Harness<'static, App>, from: &str, to: &str) {
+    h.get_by_value(from).click();
+    h.run_steps(2);
+    h.get_all_by_label(to).last().unwrap().click();
+    h.run_steps(2);
+}
+
+#[test]
+fn colormap_selector_updates_preview_and_restores_from_config() {
+    use slm_core::heatmap::Colormap;
+    let mut h = harness(false);
+    assert_eq!(h.state().config.preview_colormap, Colormap::Grayscale);
+    h.state_mut().uniform_code = 700;
+    h.run_steps(1);
+    wait_preview(&mut h);
+    let gray = h.state().preview.info.clone().unwrap();
+    assert_eq!(gray.colormap, Colormap::Grayscale);
+
+    // Switching is immediate: the old image no longer counts as current,
+    // and the new one has the same codes and digest in other colors.
+    pick_colormap(&mut h, "Grayscale", "Viridis");
+    assert_eq!(h.state().config.preview_colormap, Colormap::Viridis);
+    assert!(h.state().config_dirty);
+    wait_preview(&mut h);
+    let viridis = h.state().preview.info.clone().unwrap();
+    assert_eq!(viridis.colormap, Colormap::Viridis);
+    assert_eq!(viridis.digest, gray.digest);
+    assert_eq!(
+        (viridis.min_code, viridis.max_code_used, viridis.scale_max),
+        (700, 700, 1023)
+    );
+    pick_colormap(&mut h, "Viridis", "Rainbow");
+    wait_preview(&mut h);
+    assert_eq!(
+        h.state().preview.info.as_ref().unwrap().colormap,
+        Colormap::Rainbow
+    );
+    pick_colormap(&mut h, "Rainbow", "Viridis");
+    wait_preview(&mut h);
+
+    // Config Save writes it; Load restores it.
+    h.get_by_label("Save").click();
+    h.run_steps(2);
+    assert!(!h.state().config_dirty);
+    let path = h.state().config_path.clone();
+    assert_eq!(
+        slm_device::AppConfig::load(&path)
+            .unwrap()
+            .0
+            .preview_colormap,
+        Colormap::Viridis
+    );
+    pick_colormap(&mut h, "Viridis", "Grayscale");
+    h.get_by_label("Load").click();
+    h.run_steps(2);
+    assert_eq!(h.state().config.preview_colormap, Colormap::Grayscale);
+    h.get_by_label("Discard and Load").click();
+    h.run_steps(2);
+    assert_eq!(h.state().config.preview_colormap, Colormap::Viridis);
+    wait_preview(&mut h);
+    assert_eq!(
+        h.state().preview.info.as_ref().unwrap().colormap,
+        Colormap::Viridis
+    );
+}
+
+#[test]
+fn colormap_never_changes_what_is_sent() {
+    use slm_core::heatmap::Colormap;
+    let mut h = harness(true);
+    until(&mut h, "display list", |a| !a.displays.is_empty());
+    h.get_by_label("Connect").click();
+    until(&mut h, "connected", |a| a.connected());
+    // Applied list row: preview it under each colormap.
+    h.state_mut().uniform_code = 321;
+    h.run_steps(1);
+    h.get_by_label("Add to List").click();
+    h.run_steps(1);
+    h.get_by_label("Experiment").click();
+    h.run_steps(1);
+    h.state_mut().selected = Some(0);
+    h.run_steps(1);
+    h.get_by_label("Apply Row").click();
+    until(&mut h, "row applied", |a| {
+        a.pending.is_none() && matches!(a.status, ApplyStatus::Applied(..))
+    });
+    let sent = h.state().demo_control.lock().last_frame.clone().unwrap();
+    let shows_before = shows(&h);
+    for (from, to) in [("Grayscale", "Viridis"), ("Viridis", "Rainbow")] {
+        pick_colormap(&mut h, from, to);
+        wait_preview(&mut h);
+        let info = h.state().preview.info.clone().unwrap();
+        assert_eq!(info.digest, sent.digest(), "{to}: same codes as sent");
+    }
+    assert_eq!(h.state().config.preview_colormap, Colormap::Rainbow);
+    assert_eq!(shows(&h), shows_before, "a colormap change never sends");
+    assert_eq!(last_code(&h), Some(321));
+}
+
+#[test]
+fn name_changes_are_dirty_and_close_can_be_cancelled() {
+    let mut h = harness(true);
+    h.get_by_label("Experiment").click();
+    h.run_steps(2);
+    h.get_all_by_value("Untitled").next().unwrap().click();
+    h.run_steps(1);
+    h.get_all_by_value("Untitled")
+        .next()
+        .unwrap()
+        .type_text("changed");
+    h.run_steps(2);
+    assert!(h.state().experiment.dirty);
+    assert!(!h.state_mut().request_close());
+    h.run_steps(2);
+    h.get_by_label("Save changes before closing?");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(h.state().experiment.dirty);
+    h.get_by_label("New List").click();
+    h.run_steps(2);
+    h.get_by_label("Discard and Continue");
+}
+
+#[test]
+fn failed_save_and_close_keeps_document_open_and_dirty() {
+    let mut h = harness(true);
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("foreign.json");
+    std::fs::write(&bad, "not a list").unwrap();
+    h.state_mut().experiment.path = Some(bad.clone());
+    h.state_mut().experiment.dirty = true;
+    assert!(!h.state_mut().request_close());
+    h.run_steps(2);
+    h.get_by_label("Save and Close").click();
+    h.run_steps(2);
+    h.get_by_label("Save changes before closing?");
+    assert!(h.state().experiment.dirty);
+    assert_eq!(std::fs::read_to_string(bad).unwrap(), "not a list");
+}
+
+#[test]
+fn config_failed_save_keeps_active_path_and_dirty_state() {
+    let mut h = harness(false);
+    let active = h.state().config_path.clone();
+    let bad = active.with_file_name("foreign.json");
+    std::fs::write(&bad, "{\"schema_version\":99}").unwrap();
+    h.state_mut().config_dirty = true;
+    assert!(!h.state_mut().save_config_to(&bad));
+    assert_eq!(h.state().config_path, active);
+    assert!(h.state().config_dirty);
+    assert_eq!(
+        std::fs::read_to_string(bad).unwrap(),
+        "{\"schema_version\":99}"
+    );
+}
+
+#[test]
+fn export_runs_in_background_with_snapshot_and_closing_guard() {
+    let mut h = harness(true);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    h.state_mut().config.profile.generation.raster = slm_core::Raster {
+        width: 6,
+        height: 4,
+    };
+    h.get_by_label("Add to List").click();
+    h.run_steps(2);
+    h.state_mut().export_experiment(&out);
+    assert!(h.state().export_progress.is_some());
+    assert!(!h.state_mut().request_close());
+    h.state_mut().experiment.experiment.name = "changed after export".into();
+    until(&mut h, "export completion", |a| a.export_progress.is_none());
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(value["items"].as_array().unwrap().len(), 1);
+    assert_ne!(value["experiment_name"], "changed after export");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn mac_installed_fallback_can_draw_japanese_names() {
+    let h = harness(true);
+    assert!(
+        h.ctx
+            .fonts_mut(|fonts| fonts.has_glyphs(&egui::FontId::proportional(13.), "テスト日本語"))
+    );
+}
+
+#[test]
+fn close_waits_for_reset_and_failure_requires_explicit_choice() {
+    let mut h = harness(true);
+    until(&mut h, "display list", |a| !a.displays.is_empty());
+    h.get_by_label("Connect").click();
+    until(&mut h, "connected", |a| a.connected());
+    h.state().demo_control.lock().fail_next_show = Some("injected closing reset failure".into());
+    assert!(!h.state_mut().request_close());
+    until(&mut h, "reset failure", |a| {
+        a.log
+            .iter()
+            .any(|l| l.text.contains("injected closing reset failure"))
+    });
+    assert!(!h.state_mut().request_close());
+    h.run_steps(2);
+    h.get_by_label("Close Anyway").click();
+    h.run_steps(1);
+    assert!(h.state_mut().request_close());
+}
+
+#[test]
+fn successful_close_resets_before_allowing_exit() {
+    let mut h = harness(true);
+    until(&mut h, "display list", |a| !a.displays.is_empty());
+    h.get_by_label("Connect").click();
+    until(&mut h, "connected", |a| a.connected());
+    let before = shows(&h);
+    assert!(!h.state_mut().request_close());
+    until(&mut h, "shutdown receipt", |a| {
+        a.log
+            .iter()
+            .any(|l| l.text.contains("Output session ended"))
+    });
+    assert_eq!(shows(&h), before + 1);
+    assert_eq!(last_code(&h), Some(0));
+    assert!(h.state_mut().request_close());
+}
+
+#[test]
+fn undo_remove_restores_rows_without_losing_later_additions_or_applying() {
+    let mut h = harness(true);
+    until(&mut h, "display list", |a| !a.displays.is_empty());
+    h.get_by_label("Connect").click();
+    until(&mut h, "connected", |a| a.connected());
+    for code in [100, 200] {
+        h.state_mut().uniform_code = code;
+        h.get_by_label("Add to List").click();
+        h.run_steps(2);
+    }
+    let removed_id = h.state().experiment.experiment.items[1].id.clone();
+    let before = shows(&h);
+    h.get_by_label("Remove Selected").click();
+    h.run_steps(2);
+    h.state_mut().uniform_code = 300;
+    h.get_by_label("Add to List").click();
+    h.run_steps(2);
+    h.get_by_label("Undo Remove").click();
+    h.run_steps(2);
+    assert_eq!(h.state().experiment.experiment.items.len(), 3);
+    assert_eq!(h.state().experiment.experiment.items[1].id, removed_id);
+    assert_eq!(shows(&h), before);
+    assert!(h.state().experiment.dirty);
+}
+
+#[test]
+fn single_save_is_async_and_uses_click_time_snapshot() {
+    let mut h = harness(true);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("snapshot.csv");
+    h.state_mut().config.profile.generation.raster = slm_core::Raster {
+        width: 6,
+        height: 4,
+    };
+    h.state_mut().uniform_code = 123;
+    h.state_mut().save_preview_to(&out, false);
+    assert!(h.state().export_progress.is_some());
+    assert!(!h.state_mut().request_close());
+    h.state_mut().uniform_code = 456;
+    until(&mut h, "single save completion", |a| {
+        a.export_progress.is_none()
+    });
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("123"));
+    assert!(!text.contains("456"));
+    h.state_mut().save_preview_to(dir.path(), false);
+    until(&mut h, "save failure", |a| a.export_progress.is_none());
+    assert!(
+        h.state()
+            .log
+            .iter()
+            .any(|l| l.level == crate::app::Level::Error)
+    );
+}
+
+#[test]
+fn settings_are_drafts_until_use_and_cancel_discards() {
+    let mut h = harness(true);
+    let old = h.state().config.profile.generation.optics.pixel_pitch_um;
+    h.get_by_label("Settings").click();
+    h.run_steps(2);
+    h.get_all_by_value(&old.to_string()).next().unwrap().click();
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_value(&old.to_string())
+        .next()
+        .unwrap()
+        .type_text("20");
+    h.run_steps(2);
+    assert_eq!(
+        h.state().config.profile.generation.optics.pixel_pitch_um,
+        old
+    );
+    h.get_by_label("Cancel Settings").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().config.profile.generation.optics.pixel_pitch_um,
+        old
+    );
+    assert!(!h.state().settings_open);
+}
+
+#[test]
+fn settings_use_commits_draft_without_sending() {
+    let mut h = harness(true);
+    let old = h.state().config.profile.generation.optics.pixel_pitch_um;
+    h.get_by_label("Settings").click();
+    h.run_steps(2);
+    h.get_all_by_value(&old.to_string()).next().unwrap().click();
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_value(&old.to_string())
+        .next()
+        .unwrap()
+        .type_text("20");
+    h.run_steps(2);
+    h.get_by_label("Use Settings").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().config.profile.generation.optics.pixel_pitch_um,
+        20.
+    );
+    assert!(h.state().config_dirty);
+    assert_eq!(shows(&h), 0);
+}
+
+#[test]
+fn list_shortcuts_apply_save_and_undo_but_not_while_typing() {
+    let mut h = harness(true);
+    let dir = tempfile::tempdir().unwrap();
+    h.state_mut().experiment.path = Some(dir.path().join("list.json"));
+    until(&mut h, "display list", |a| !a.displays.is_empty());
+    h.get_by_label("Connect").click();
+    until(&mut h, "connected", |a| a.connected());
+    h.get_by_label("Auto-apply on click").click();
+    h.state_mut().uniform_code = 12;
+    h.get_by_label("Add to List").click();
+    h.run_steps(2);
+    h.get_by_label("#1 Uniform code 12").click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    until(&mut h, "keyboard apply", |a| a.showing_index() == Some(0));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    h.run_steps(2);
+    assert!(!h.state().experiment.dirty);
+    assert!(dir.path().join("list.json").is_file());
+    h.get_by_label("Remove Selected").click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(h.state().experiment.experiment.items.len(), 1);
+    h.get_by_label("Experiment").click();
+    h.run_steps(2);
+    h.get_all_by_value("Untitled").next().unwrap().click();
+    h.run_steps(1);
+    let before = shows(&h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(shows(&h), before, "typing cannot trigger apply");
+}
+
+#[test]
+fn compact_numeric_display_and_invalid_text_preserve_full_value() {
+    let mut h = harness(true);
+    let exact = 123.1234567890123;
+    h.state_mut().single.wave.period.value = exact;
+    h.get_by_label("Single Wave").click();
+    h.run_steps(2);
+    assert_eq!(h.state().single.wave.period.value, exact);
+    h.get_all_by_value("1.2312e2").next().unwrap().click();
+    h.run_steps(2);
+    assert_eq!(h.state().single.wave.period.value, exact);
+    h.get_all_by_value(&exact.to_string())
+        .next()
+        .expect("focused numeric field shows full round-trip precision");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("NaN".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().single.wave.period.value, exact);
+}
+
+#[test]
+fn closing_with_settings_draft_requires_explicit_resolution() {
+    let mut h = harness(true);
+    let old = h.state().config.profile.generation.optics.pixel_pitch_um;
+    h.get_by_label("Settings").click();
+    h.run_steps(2);
+    h.get_all_by_value(&old.to_string()).next().unwrap().click();
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_all_by_value(&old.to_string())
+        .next()
+        .unwrap()
+        .type_text("20");
+    h.run_steps(2);
+    assert!(!h.state_mut().request_close());
+    h.run_steps(2);
+    assert!(h.state().settings_open);
+    assert_eq!(
+        h.state().config.profile.generation.optics.pixel_pitch_um,
+        old
+    );
+    h.get_by_label("Cancel Settings").click();
+    h.run_steps(2);
+    assert!(!h.state().settings_open);
+    assert!(!h.state_mut().request_close()); // async shutdown begins only now
+    until(&mut h, "clean shutdown", |a| {
+        a.log
+            .iter()
+            .any(|l| l.text.contains("Already disconnected"))
+    });
+    assert!(h.state_mut().request_close());
 }

@@ -18,6 +18,7 @@ pub mod units;
 
 pub use frame::{CodeFrame, PhaseFrame, Rendered};
 pub use pattern::{
-    GenerationProfile, Geometry, PatternSpec, PhaseCalibration, Raster, WaveComponent, Waveform,
+    GenerationProfile, Geometry, PatternSpec, PhaseCalibration, PhaseMapping, Raster,
+    WaveComponent, Waveform,
 };
 pub use units::{AngleUnit, AngleValue, Optics, PeriodUnit, PeriodValue, PhaseUnit, PhaseValue};
