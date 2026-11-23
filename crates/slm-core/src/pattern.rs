@@ -344,7 +344,10 @@ fn rotation(
         }
         AngleUnit::Radian => geometry.rotation.value - profile.mount_angle_deg.to_radians(),
     };
-    Ok((radians.cos(), radians.sin()))
+    // Use the same math implementation on every platform. The Windows CRT
+    // rounds sin(π/4) one ULP differently from the reference. At a binary stripe
+    // boundary that can change the encoded phase by π.
+    Ok((libm::cos(radians), libm::sin(radians)))
 }
 
 struct PreparedWave {

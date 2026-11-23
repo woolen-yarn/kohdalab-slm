@@ -71,8 +71,9 @@ def main(descriptor, item_id):
         done = slm.wait(slm.invoke("apply", spec=SINGLE_WAVE)["job_id"], timeout=20)
         assert done["native"]["receipt"]["uniform_code"] is None, done
 
-        done = slm.wait(slm.invoke("apply", item_id=item_id)["job_id"], timeout=20)
-        assert done["native"]["receipt"]["uniform_code"] == 321, done
+        if item_id is not None:
+            done = slm.wait(slm.invoke("apply", item_id=item_id)["job_id"], timeout=20)
+            assert done["native"]["receipt"]["uniform_code"] == 321, done
 
         # Explicit request ID: a repeated request is answered, not re-run.
         request_id = str(uuid.uuid4())

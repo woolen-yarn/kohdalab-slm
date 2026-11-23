@@ -161,10 +161,10 @@ fn demo_connect_apply_and_step_through_sweep() {
 
 #[test]
 fn unconfirmed_mode_keeps_connect_disabled() {
-    let mut h = harness(false);
+    let mut h = harness(true);
     until(&mut h, "display list", |a| !a.displays.is_empty());
-    let slm = h.state().displays[1].selection();
-    h.state_mut().config.output.display = Some(slm);
+    // Use a valid display with no mode confirmation, even on headless CI.
+    h.state_mut().config.output.confirmed_mode = None;
     h.run_steps(2);
     h.get_by_label("Connect").click();
     h.run_steps(3);

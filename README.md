@@ -7,12 +7,11 @@
 
 Rust / `egui` desktop app for creating SLM patterns, keeping ordered experiment lists and
 switching patterns by hand. First target: **Santec SLM-200** over Windows HDMI/DVI
-(extended desktop). macOS builds generate, edit and export but only use the simulated
-output.
+(extended desktop). macOS and Linux builds generate, edit and export with simulated output.
 
 Santec SLM-200向けのRust製デスクトップアプリです。パターン生成、スイープ、
 並べ替えと手動切り替え、CSV／PNG出力に対応します。WindowsではHDMI／DVIで
-実機に出力し、macOSではシミュレーションで同じ操作を試せます。
+実機に出力し、macOSとLinuxではシミュレーションで同じ操作を試せます。
 
 [Documentation / ドキュメント](docs/hardware-checklist.md) · [Report an issue / 問題を報告](https://github.com/woolen-yarn/kohdalab-slm/issues)
 
@@ -21,6 +20,27 @@ Agreed specification: [`kohdalab-slm-design.md`](kohdalab-slm-design.md).
 > **Hardware status:** The Windows bench LCOS-SLM display showed a 200 px Single Wave
 > with matching Windows desktop readback. See the [bench checklist](docs/hardware-checklist.md)
 > for optical verification.
+
+## Download / ダウンロード
+
+[Public preview v0.1.0 / 公開プレビュー](https://github.com/woolen-yarn/kohdalab-slm/releases/tag/v0.1.0)
+
+| OS / 用途 | Installer / インストーラー | Portable / ポータブル |
+| --- | --- | --- |
+| Windows x64 · HDMI/DVI or Demo | [Setup](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/KohdaLab-SLM-0.1.0-Setup.exe) | [ZIP](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-windows-x64-portable.zip) |
+| macOS Apple Silicon · Demo | [DMG](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-macos-arm64.dmg) | [ZIP](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-macos-arm64-portable.zip) |
+| Ubuntu 22.04+ x64 · Demo | [DEB](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-linux-x64.deb) | [tar.gz](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-linux-x64-portable.tar.gz) |
+
+[SHA-256](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/SHA256SUMS.txt) · [Python GUI control / Pythonからの操作](docs/gui-control-api.md)
+
+Windows Setup puts the app in `C:\Program Files\Kohdalab\KohdaLab SLM`.
+Windows packages are unsigned. The macOS app is ad-hoc signed and is not notarized.
+Start with `--demo --gui-api` to exercise Python control without hardware.
+Physical output changes introduced in this preview have not been optically qualified.
+
+Windows Setupのインストール先は `C:\Program Files\Kohdalab\KohdaLab SLM` です。
+Windows版は未署名、macOS版はアドホック署名で公証なしです。初回のPython操作は
+`--demo --gui-api` でお試しください。今回の変更は実機での光学検証前です。
 
 ## Workspace / 構成
 
