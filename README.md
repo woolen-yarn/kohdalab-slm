@@ -23,24 +23,24 @@ Agreed specification: [`kohdalab-slm-design.md`](kohdalab-slm-design.md).
 
 ## Download / ダウンロード
 
-[Public preview v0.1.0 / 公開プレビュー](https://github.com/woolen-yarn/kohdalab-slm/releases/tag/v0.1.0)
+[Stable release v1.0.0 / 安定版](https://github.com/woolen-yarn/kohdalab-slm/releases/tag/v1.0.0)
 
 | OS / 用途 | Installer / インストーラー | Portable / ポータブル |
 | --- | --- | --- |
-| Windows x64 · HDMI/DVI or Demo | [Setup](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/KohdaLab-SLM-0.1.0-Setup.exe) | [ZIP](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-windows-x64-portable.zip) |
-| macOS Apple Silicon · Demo | [DMG](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-macos-arm64.dmg) | [ZIP](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-macos-arm64-portable.zip) |
-| Ubuntu 22.04+ x64 · Demo | [DEB](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-linux-x64.deb) | [tar.gz](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/kohdalab-slm-0.1.0-linux-x64-portable.tar.gz) |
+| Windows x64 · HDMI/DVI or Demo | [Setup](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v1.0.0/KohdaLab-SLM-1.0.0-Setup.exe) | [ZIP](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v1.0.0/kohdalab-slm-1.0.0-windows-x64-portable.zip) |
+| macOS Apple Silicon · Demo | [DMG](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v1.0.0/kohdalab-slm-1.0.0-macos-arm64.dmg) | [ZIP](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v1.0.0/kohdalab-slm-1.0.0-macos-arm64-portable.zip) |
+| Ubuntu 22.04+ x64 · Demo | [DEB](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v1.0.0/kohdalab-slm-1.0.0-linux-x64.deb) | [tar.gz](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v1.0.0/kohdalab-slm-1.0.0-linux-x64-portable.tar.gz) |
 
-[SHA-256](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v0.1.0/SHA256SUMS.txt) · [Python GUI control / Pythonからの操作](docs/gui-control-api.md)
+[SHA-256](https://github.com/woolen-yarn/kohdalab-slm/releases/download/v1.0.0/SHA256SUMS.txt) · [Python GUI control / Pythonからの操作](docs/gui-control-api.md)
 
 Windows Setup puts the app in `C:\Program Files\Kohdalab\KohdaLab SLM`.
 Windows packages are unsigned. The macOS app is ad-hoc signed and is not notarized.
 Start with `--demo --gui-api` to exercise Python control without hardware.
-Physical output changes introduced in this preview have not been optically qualified.
+Optical qualification of the Python output path is still pending.
 
 Windows Setupのインストール先は `C:\Program Files\Kohdalab\KohdaLab SLM` です。
 Windows版は未署名、macOS版はアドホック署名で公証なしです。初回のPython操作は
-`--demo --gui-api` でお試しください。今回の変更は実機での光学検証前です。
+`--demo --gui-api` でお試しください。Python出力経路の実機光学検証は未実施です。
 
 ## Workspace / 構成
 
