@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "kohdalab-slm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "eframe",
  "egui_kittest",
@@ -2709,7 +2709,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slm-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "image",
  "libm",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "slm-device"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
