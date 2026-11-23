@@ -1,5 +1,7 @@
 """Exercise a packaged SLM GUI from the separate SDK with no physical output."""
 
+import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -46,5 +48,22 @@ def verify(binary: Path) -> None:
                         process.wait(timeout=5)
 
 
+def verify_headless(binary: Path) -> None:
+    """The Windows hosted runner has no OpenGL 2 desktop context."""
+    with tempfile.TemporaryDirectory(prefix="kohdalab-slm-headless-") as home:
+        directory = Path(home) / "smoke"
+        env = dict(os.environ, HOME=home, USERPROFILE=home)
+        subprocess.run([str(binary.resolve()), "--demo-smoke", str(directory)],
+                       env=env, timeout=30, check=True)
+        report = json.loads((directory / "smoke-summary.json").read_text(encoding="utf-8"))
+        if not report:
+            raise RuntimeError("Demo produced no verification results")
+        print(json.dumps(report, ensure_ascii=True))
+
+
 if __name__ == "__main__":
-    verify(Path(sys.argv[1]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("--headless", action="store_true")
+    args = parser.parse_args()
+    (verify_headless if args.headless else verify)(args.binary)

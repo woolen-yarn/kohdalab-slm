@@ -65,7 +65,7 @@ jobs:
           $setup = Join-Path $PWD "dist\KohdaLab-SLM-$env:SLM_VERSION-Setup.exe"
           Compress-Archive -Path 'payload\*' -DestinationPath "dist\$name-portable.zip"
           Expand-Archive "dist\$name-portable.zip" portable
-          python packaging/smoke.py portable/kohdalab-slm.exe
+          python packaging/smoke.py portable/kohdalab-slm.exe --headless
           if ($LASTEXITCODE) { throw 'Portable demo failed' }
           python packaging/fetch_nsis.py --output "$env:RUNNER_TEMP/slm-nsis"
           if ($LASTEXITCODE) { throw 'NSIS fetch failed' }
@@ -84,7 +84,7 @@ jobs:
           $expected = (Get-FileHash 'portable\kohdalab-slm.exe').Hash
           if ($actual -ne $expected) { throw 'Setup binary differs from portable' }
           if (!(Test-Path "$installed\bindings\control\kohdalab_control.py")) { throw 'SDK missing from Setup' }
-          python packaging/smoke.py "$installed\kohdalab-slm.exe"
+          python packaging/smoke.py "$installed\kohdalab-slm.exe" --headless
           if ($LASTEXITCODE) { throw 'Installed demo failed' }
           $process = Start-Process "$installed\Uninstall KohdaLab SLM.exe" -ArgumentList '/S' -Wait -PassThru
           if ($process.ExitCode -or (Test-Path "$installed\kohdalab-slm.exe")) { throw 'Uninstaller failed' }
