@@ -273,6 +273,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
     let mut worker = DeviceWorker::spawn(default_factory(demo.clone()), Box::new(|| {}));
     let selection = demo_displays()[1].selection();
     worker.send(Command::Connect {
+        request: 0,
         backend: BackendKind::Demo,
         selection: Some(selection.clone()),
         mode: None,
@@ -289,6 +290,7 @@ pub fn run(dir: &Path) -> Result<(), String> {
         "no frame sent",
     );
     worker.send(Command::Connect {
+        request: 0,
         backend: BackendKind::Demo,
         selection: Some(selection),
         mode: Some(InputMode::Hz60),

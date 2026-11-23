@@ -65,19 +65,25 @@ kohdalab-slm --demo                # simulated output only, temporary config
 kohdalab-slm --demo-wavelength     # demo with wavelength controls open
 kohdalab-slm --demo-capture <png> [w h [tab [expanded]]]  # demo check: connect, apply, sweep, step through the list, screenshot own window, close
 kohdalab-slm --demo-smoke <dir>    # headless demo vertical slice; writes evidence to a new dir
-kohdalab-slm --gui-api [--demo | --demo-wavelength | --config <path>]  # also start the read-only GUI API
+kohdalab-slm --gui-api [--demo | --demo-wavelength | --config <path>]  # also start the loopback GUI API
 ```
 
 `--demo`, `--demo-wavelength`, `--demo-capture` and `--demo-smoke` only create the demo backend; they never
 enumerate real displays or open an output window.
 
-`--gui-api` is opt-in. It starts a loopback-only, read-only control adapter
-(`control.describe`, `control.status`, `control.config`) and shows **External control ·
-Read only** in the tab row. The API cannot connect, apply patterns or change settings.
+`--gui-api` is opt-in. It starts a loopback-only control adapter for the common Python
+SDK: reads (`describe`, `status`, `config`, `result`) and, under a heartbeat lease,
+`connect`, `apply` (a validated `PatternSpec` or a Patterns row), `reset`, `disconnect`
+and `stop`. Connect uses only the display selected and the input mode confirmed in the
+GUI. Release, lease expiry and listener loss stop the output (reset, then close). The
+tab row shows the **External control** state with **Stop** and **Take control**; manual
+output controls are locked while a client holds the lease. Settings, display selection
+and the wavelength are never changed by the API.
 See [docs/gui-control-api.md](docs/gui-control-api.md).
 
-`--gui-api` は任意指定です。ループバック限定・読み取り専用の窓口を起動し、タブ行に
-**External control · Read only** を表示します。接続・パターン送信・設定変更はできません。
+`--gui-api` は任意指定です。ループバック限定の窓口を起動し、リース取得後のPythonから
+接続・パターン送信・リセット・停止ができます。表示先と入力モードはGUIの設定だけを使います。
+タブ行の **Stop** と **Take control** でいつでも操作者が制御を取り戻せます。
 
 ## Output safety rules (Windows backend)
 
@@ -154,4 +160,5 @@ of the second frame, so the mode cannot be confirmed in the GUI and is refused b
 - GPU color processing after composition (gamma, Night Light, ICC, dithering), which the
   desktop readback cannot see.
 - That the reset code `0` and the notebook calibration match the vendor software.
-- Thorlabs EXULUS, USB/SDK output and Python control (later stages).
+- Python control on real hardware: the leased GUI API is tested on the demo backend only.
+- Thorlabs EXULUS and USB/SDK output (later stages).

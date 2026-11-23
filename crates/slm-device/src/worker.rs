@@ -47,7 +47,9 @@ pub enum Command {
     ListDisplays {
         backend: BackendKind,
     },
+    /// Acknowledged by exactly one [`Event::ConnectDone`] with `request`.
     Connect {
+        request: u64,
         backend: BackendKind,
         selection: Option<DisplaySelection>,
         mode: Option<InputMode>,
@@ -65,6 +67,7 @@ pub enum Command {
         usb_device: u32,
         requested_nm: Option<u32>,
     },
+    /// Acknowledged by exactly one [`Event::DisconnectDone`] with `request`.
     Disconnect {
         request: u64,
     },
@@ -130,6 +133,55 @@ pub enum Event {
     },
     Wavelength(Result<u32, String>),
     Log(String),
+    /// Worker acknowledgement of one `Connect`. `Ok` carries the receipt of
+    /// the backend-confirmed reset frame. `Err` says whether the output is
+    /// still known (`true`: this attempt left nothing on screen).
+    ConnectDone {
+        request: u64,
+        result: Result<ShowReceipt, ConnectFailure>,
+    },
+    /// Worker acknowledgement of one `Disconnect` (also emitted on shutdown
+    /// with request 0) after the output was closed or found already closed.
+    DisconnectDone {
+        request: u64,
+        report: DisconnectReport,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectFailure {
+    pub error: String,
+    pub output_known: bool,
+}
+
+/// What the reset-before-close step of a disconnect actually did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResetOutcome {
+    /// The backend confirmed the uniform reset frame before closing.
+    Confirmed(ShowReceipt),
+    /// The reset draw failed; the output was hidden and closed unverified.
+    Failed(String),
+    /// A session was open but its output was not trusted; no reset was sent.
+    SkippedUnknown,
+    /// No output was open. `was_unknown`: the previous output was unknown.
+    NotOpen { was_unknown: bool },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisconnectReport {
+    pub reset: ResetOutcome,
+    /// Uniform raw device code of the reset frame (profile `reset_code`).
+    pub reset_code: Option<u16>,
+    pub close_error: Option<String>,
+    pub summary: String,
+}
+
+impl DisconnectReport {
+    /// The backend confirmed the reset frame and the output closed without
+    /// error. A backend receipt, not an optical measurement.
+    pub fn reset_confirmed(&self) -> bool {
+        matches!(self.reset, ResetOutcome::Confirmed(_)) && self.close_error.is_none()
+    }
 }
 
 pub type BackendFactory = Box<dyn Fn(BackendKind) -> Result<Box<dyn OutputBackend>, String> + Send>;
@@ -210,19 +262,44 @@ impl Worker {
 
     fn connect(
         &mut self,
+        request: u64,
         kind: BackendKind,
         selection: Option<DisplaySelection>,
         mode: Option<InputMode>,
         profile: DeviceProfile,
     ) {
+        let result = self.connect_inner(kind, selection, mode, profile);
+        self.emit(Event::ConnectDone { request, result });
+    }
+
+    fn connect_inner(
+        &mut self,
+        kind: BackendKind,
+        selection: Option<DisplaySelection>,
+        mode: Option<InputMode>,
+        profile: DeviceProfile,
+    ) -> Result<ShowReceipt, ConnectFailure> {
+        let known = |error: String| ConnectFailure {
+            error,
+            output_known: true,
+        };
         if self.session.is_some() {
-            self.log("Connect ignored: disconnect first, then select the display and reconnect.");
-            return;
+            let e = "Connect ignored: disconnect first, then select the display and reconnect.";
+            self.log(e);
+            return Err(known(e.into()));
+        }
+        if let DeviceState::Unknown { .. } = self.state {
+            let e = "Connect ignored: the output state is unknown; disconnect first.";
+            self.log(e);
+            return Err(ConnectFailure {
+                error: e.into(),
+                output_known: false,
+            });
         }
         if let Err(e) = profile.validate() {
             self.log(format!("Connect refused: {e}"));
             self.set_state(DeviceState::Disconnected);
-            return;
+            return Err(known(format!("Connect refused: {e}")));
         }
         self.set_state(DeviceState::Connecting);
         let mut backend = match (self.factory)(kind) {
@@ -230,7 +307,7 @@ impl Worker {
             Err(e) => {
                 self.log(format!("Connect failed: {e}"));
                 self.set_state(DeviceState::Disconnected);
-                return;
+                return Err(known(format!("Connect failed: {e}")));
             }
         };
         let raster = profile.generation.raster;
@@ -256,7 +333,7 @@ impl Worker {
             Err(e) => {
                 self.log(format!("Connect refused, nothing was sent: {e}"));
                 self.set_state(DeviceState::Disconnected);
-                return;
+                return Err(known(format!("Connect refused, nothing was sent: {e}")));
             }
         };
         let (Some(selection), Some(mode)) = (selection, mode) else {
@@ -270,7 +347,9 @@ impl Worker {
             let _ = backend.close();
             self.log(format!("Connect failed while creating the output: {e}"));
             self.set_state(DeviceState::Disconnected);
-            return;
+            return Err(known(format!(
+                "Connect failed while creating the output: {e}"
+            )));
         }
         self.session = Some(Session {
             backend,
@@ -296,13 +375,18 @@ impl Worker {
                     showing: Showing {
                         item_id: None,
                         label: format!("Reset pattern (code {})", profile.reset_code),
-                        receipt,
+                        receipt: receipt.clone(),
                     },
                 });
+                Ok(receipt)
             }
             Err(e) => {
                 self.log(format!("Initial reset pattern failed: {e}"));
-                self.set_state(DeviceState::Unknown { reason: e });
+                self.set_state(DeviceState::Unknown { reason: e.clone() });
+                Err(ConnectFailure {
+                    error: format!("Initial reset pattern failed: {e}"),
+                    output_known: false,
+                })
             }
         }
     }
@@ -475,40 +559,75 @@ impl Worker {
         );
     }
 
-    /// Reset (when the output is trusted), then close.
-    fn disconnect(&mut self) -> String {
-        let summary = match &self.session {
+    /// Reset (when the output is trusted), then close. Emits the
+    /// `DisconnectDone` acknowledgement for `request`; returns the summary.
+    fn disconnect(&mut self, request: u64) -> String {
+        let report = self.disconnect_inner();
+        let summary = report.summary.clone();
+        self.emit(Event::DisconnectDone { request, report });
+        summary
+    }
+
+    fn disconnect_inner(&mut self) -> DisconnectReport {
+        let (reset, reset_code, summary) = match &self.session {
             None => {
                 let was_unknown = matches!(self.state, DeviceState::Unknown { .. });
                 self.set_state(DeviceState::Disconnected);
-                return if was_unknown {
-                    "Disconnected. The SLM output state was unknown and is still unverified.".into()
+                let summary = if was_unknown {
+                    "Disconnected. The SLM output state was unknown and is still unverified."
                 } else {
-                    "Already disconnected.".into()
+                    "Already disconnected."
+                };
+                return DisconnectReport {
+                    reset: ResetOutcome::NotOpen { was_unknown },
+                    reset_code: None,
+                    close_error: None,
+                    summary: summary.into(),
                 };
             }
             Some(session) => {
                 let profile = session.profile.clone();
                 if self.state.is_connected() {
                     match self.show(&Self::reset_frame(&profile)) {
-                        Ok(_) => format!(
-                            "Reset pattern code {} sent before closing.",
-                            profile.reset_code
+                        Ok(receipt) => (
+                            ResetOutcome::Confirmed(receipt),
+                            Some(profile.reset_code),
+                            format!(
+                                "Reset pattern code {} sent before closing.",
+                                profile.reset_code
+                            ),
                         ),
-                        Err(e) => format!("Reset before closing failed: {e}."),
+                        Err(e) => (
+                            ResetOutcome::Failed(e.clone()),
+                            Some(profile.reset_code),
+                            format!("Reset before closing failed: {e}."),
+                        ),
                     }
                 } else {
-                    "Output state was unknown; no reset was sent.".into()
+                    (
+                        ResetOutcome::SkippedUnknown,
+                        Some(profile.reset_code),
+                        "Output state was unknown; no reset was sent.".into(),
+                    )
                 }
             }
         };
+        let mut close_error = None;
         if let Some(mut session) = self.session.take()
             && let Err(e) = session.backend.close()
         {
             self.log(format!("Close output: {e}"));
+            close_error = Some(e);
         }
         self.set_state(DeviceState::Disconnected);
-        format!("{summary} Output closed; what the SLM shows after closing is not verified.")
+        DisconnectReport {
+            reset,
+            reset_code,
+            close_error,
+            summary: format!(
+                "{summary} Output closed; what the SLM shows after closing is not verified."
+            ),
+        }
     }
 
     fn poll(&mut self) {
@@ -529,11 +648,12 @@ impl Worker {
             match commands.recv_timeout(Duration::from_millis(200)) {
                 Ok(Command::ListDisplays { backend }) => self.list_displays(backend),
                 Ok(Command::Connect {
+                    request,
                     backend,
                     selection,
                     mode,
                     profile,
-                }) => self.connect(backend, selection, mode, profile),
+                }) => self.connect(request, backend, selection, mode, profile),
                 Ok(Command::Apply { request, item }) => self.apply(request, item),
                 Ok(Command::Reset { request }) => self.reset(request),
                 Ok(Command::Wavelength {
@@ -544,18 +664,18 @@ impl Worker {
                     let result = self.wavelength(backend, usb_device, requested_nm);
                     self.emit(Event::Wavelength(result));
                 }
-                Ok(Command::Disconnect { .. }) => {
-                    let summary = self.disconnect();
+                Ok(Command::Disconnect { request }) => {
+                    let summary = self.disconnect(request);
                     self.log(summary);
                 }
                 Ok(Command::Shutdown { reply }) => {
-                    let summary = self.disconnect();
+                    let summary = self.disconnect(0);
                     let _ = reply.send(Ok(summary));
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    let _ = self.disconnect();
+                    let _ = self.disconnect(0);
                     return;
                 }
             }
@@ -709,6 +829,7 @@ mod tests {
         fn connect(&self, mode: Option<InputMode>) -> DeviceState {
             self.worker
                 .send(Command::Connect {
+                    request: 0,
                     backend: BackendKind::Demo,
                     selection: Some(slm_selection()),
                     mode,
@@ -899,6 +1020,7 @@ mod tests {
         r.demo.lock().remote_session = false;
         r.worker
             .send(Command::Connect {
+                request: 0,
                 backend: BackendKind::Demo,
                 selection: Some(demo_displays()[0].selection()),
                 mode: Some(InputMode::Hz60),
@@ -907,6 +1029,81 @@ mod tests {
             .unwrap();
         assert_eq!(r.state(), DeviceState::Disconnected);
         assert_eq!(r.demo.lock().shows, 0);
+    }
+
+    fn connect_ack(
+        r: &Rig,
+        request: u64,
+        mode: Option<InputMode>,
+    ) -> Result<ShowReceipt, ConnectFailure> {
+        r.worker
+            .send(Command::Connect {
+                request,
+                backend: BackendKind::Demo,
+                selection: Some(slm_selection()),
+                mode,
+                profile: DeviceProfile::santec_slm200_candidate(),
+            })
+            .unwrap();
+        r.until(|e| match e {
+            Event::ConnectDone { request: q, result } if *q == request => Some(result.clone()),
+            _ => None,
+        })
+    }
+
+    fn disconnect_ack(r: &Rig, request: u64) -> DisconnectReport {
+        r.worker.send(Command::Disconnect { request }).unwrap();
+        r.until(|e| match e {
+            Event::DisconnectDone { request: q, report } if *q == request => Some(report.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn connect_and_disconnect_are_acknowledged_with_their_request() {
+        let r = rig();
+        // A refused connect from `Disconnected` changes no state, but is
+        // still acknowledged, with the output known (nothing was sent).
+        let refused = connect_ack(&r, 7, None).unwrap_err();
+        assert!(refused.output_known, "{refused:?}");
+        assert_eq!(r.demo.lock().shows, 0);
+        let receipt = connect_ack(&r, 8, Some(InputMode::Hz60)).unwrap();
+        assert_eq!(receipt.uniform_code, Some(0));
+        // A second connect is ignored and acknowledged as a known failure.
+        assert!(
+            connect_ack(&r, 9, Some(InputMode::Hz60))
+                .unwrap_err()
+                .output_known
+        );
+        let report = disconnect_ack(&r, 10);
+        assert!(report.reset_confirmed(), "{report:?}");
+        assert_eq!(report.reset_code, Some(0));
+        assert!(!r.demo.lock().open);
+        // Disconnecting again is a no-op, still acknowledged.
+        let report = disconnect_ack(&r, 11);
+        assert_eq!(report.reset, ResetOutcome::NotOpen { was_unknown: false });
+        assert!(!report.reset_confirmed());
+    }
+
+    #[test]
+    fn failed_reset_before_close_is_reported_not_confirmed() {
+        let r = rig();
+        connect_ack(&r, 1, Some(InputMode::Hz60)).unwrap();
+        r.demo.lock().fail_next_show = Some("device lost".into());
+        let report = disconnect_ack(&r, 2);
+        assert!(
+            matches!(report.reset, ResetOutcome::Failed(_)),
+            "{report:?}"
+        );
+        assert!(!report.reset_confirmed());
+        assert!(!r.demo.lock().open);
+        // After an unknown output, disconnect reports it was unknown.
+        connect_ack(&r, 3, Some(InputMode::Hz60)).unwrap();
+        r.demo.lock().pending_invalidation = Some("moved".into());
+        assert!(matches!(r.state(), DeviceState::Unknown { .. }));
+        assert!(connect_ack(&r, 4, Some(InputMode::Hz60)).is_err_and(|f| !f.output_known));
+        let report = disconnect_ack(&r, 5);
+        assert_eq!(report.reset, ResetOutcome::NotOpen { was_unknown: true });
     }
 
     #[test]

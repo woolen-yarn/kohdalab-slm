@@ -31,9 +31,10 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod control;
 mod ui;
 #[cfg(test)]
-pub(crate) use ui::EXTERNAL_CONTROL;
+pub(crate) use ui::{EXTERNAL_CONTROL, EXTERNAL_LEASED};
 
 const MAX_LOG: usize = 500;
 
@@ -158,8 +159,9 @@ pub struct AppOptions {
     /// Demo launch check: connect, apply one pattern, save a screenshot of
     /// this window to the path, then close.
     pub capture: Option<PathBuf>,
-    /// `--gui-api`: start the read-only loopback control adapter. Off by
-    /// default; nothing is bound or written unless this is set.
+    /// `--gui-api`: start the loopback control adapter (reads, plus leased
+    /// output operations). Off by default; nothing is bound or written
+    /// unless this is set.
     pub gui_api: bool,
 }
 
@@ -228,8 +230,10 @@ pub struct App {
     /// Full per-value validation of the sweep draft, keyed by the draft and
     /// profile so it is recomputed only after an edit.
     sweep_check: std::cell::RefCell<Option<(String, Result<(), String>)>>,
-    /// Read-only external control (`--gui-api`); `None` in standalone use.
+    /// External control (`--gui-api`); `None` in standalone use.
     pub control_api: Option<crate::control_api::Server>,
+    /// Writer lease, job receipts and request-ID record for the API.
+    pub control: crate::control_lease::Engine,
     /// Disconnect sent; cleared when the worker reports `Disconnected`.
     pub disconnecting: bool,
     /// Why the output became unknown; cleared only by a confirmed draw.
@@ -381,6 +385,7 @@ impl App {
             window_fit: WindowFitState::default(),
             sweep_check: std::cell::RefCell::new(None),
             control_api: None,
+            control: Default::default(),
             disconnecting: false,
             output_unverified: None,
             capture: options.capture.map(|path| Capture {
@@ -408,7 +413,7 @@ impl App {
                     app.control_api = Some(server);
                     app.push_log(
                         Level::Info,
-                        "External control: read-only GUI API on loopback (describe/status/config).",
+                        "External control: GUI API on loopback. A leased client can connect, apply, reset and stop; Stop and Take control stay in this window.",
                     );
                 }
                 Err(e) => app.push_log(Level::Warn, format!("GUI API not started: {e}")),
@@ -418,7 +423,7 @@ impl App {
         app
     }
 
-    /// Read-only external control is active (shown in the tab row).
+    /// External control is active (state, Stop and Take control in the tab row).
     pub fn external_control(&self) -> bool {
         self.control_api
             .as_ref()
@@ -454,38 +459,13 @@ impl App {
             disconnecting: self.disconnecting,
             output_unverified: self.output_unverified.clone(),
             home: slm_device::config::home_dir(),
-        }
-    }
-
-    /// Answer queued read-only requests from this frame's GUI state. Never
-    /// sends a worker command and never changes App state.
-    pub fn process_control_api(&mut self) {
-        // A listener that ended (permanent accept error) has already withdrawn
-        // its descriptor; drop it so no active indicator remains.
-        if self
-            .control_api
-            .as_ref()
-            .is_some_and(|api| !api.is_active())
-        {
-            self.control_api = None;
-            self.push_log(
-                Level::Warn,
-                "External control stopped: GUI API listener ended.",
-            );
-            return;
-        }
-        let requests: Vec<_> = self
-            .control_api
-            .as_ref()
-            .map(|api| api.requests.try_iter().take(8).collect())
-            .unwrap_or_default();
-        for request in requests {
-            let value = if request.deadline < std::time::Instant::now() {
-                crate::control_api::expired(&request.body)
-            } else {
-                crate::control_api::respond(&request.body, || self.control_snapshot())
-            };
-            let _ = request.reply.send(value);
+            lease_owned: self.control.lease.is_some(),
+            operation: self
+                .control
+                .running()
+                .map(|job| (job.id.clone(), job.kind.name())),
+            closing: self.control.running_close().is_some(),
+            last_revocation: self.control.last_revocation.map(|r| r.name()),
         }
     }
 
@@ -504,8 +484,12 @@ impl App {
         self.device_state.is_connected()
     }
 
+    /// Device, display, mode and profile edits are locked: output is open,
+    /// a wavelength operation runs, or external control holds the device.
     fn device_busy(&self) -> bool {
-        self.wavelength_busy || !matches!(self.device_state, DeviceState::Disconnected)
+        self.wavelength_busy
+            || !matches!(self.device_state, DeviceState::Disconnected)
+            || self.lease_block().is_some()
     }
 
     fn request_wavelength(&mut self, write: bool) {
@@ -638,6 +622,7 @@ impl App {
                     receipt,
                     ..
                 } => {
+                    self.finish_apply_job(request, Ok(&receipt));
                     let record = match self.pending.take() {
                         Some((r, record)) if r == request => record,
                         other => {
@@ -684,6 +669,7 @@ impl App {
                     if !output_known && self.output_unverified.is_none() {
                         self.output_unverified = Some(error.clone());
                     }
+                    self.finish_apply_job(request, Err((error.as_str(), output_known)));
                     self.status = ApplyStatus::Failed {
                         record,
                         error,
@@ -718,42 +704,111 @@ impl App {
                     };
                     self.push_log(level, text);
                 }
+                Event::ConnectDone { request, result } => {
+                    self.finish_connect_job(request, &result);
+                }
+                Event::DisconnectDone { request, report } => {
+                    use slm_device::worker::ResetOutcome;
+                    // A reset that was not confirmed before closing leaves
+                    // the output unverified, exactly like a failed draw.
+                    let unverified = match (&report.reset, &report.close_error) {
+                        (ResetOutcome::Failed(e), _) => {
+                            Some(format!("Reset before closing failed: {e}"))
+                        }
+                        (_, Some(e)) => Some(format!("Closing the output failed: {e}")),
+                        _ => None,
+                    };
+                    if let Some(reason) = unverified
+                        && self.output_unverified.is_none()
+                    {
+                        self.push_log(Level::Error, format!("Output unknown: {reason}"));
+                        self.output_unverified = Some(reason);
+                    }
+                    self.disconnecting = false;
+                    self.finish_close_job(request, &report);
+                }
             }
         }
     }
 
     // ----- actions --------------------------------------------------------
 
+    /// Manual mutations are refused while external control holds the lease
+    /// (or its operation/cleanup is still pending). Stop and Take control
+    /// in the External control row stay available.
+    fn manual_refused(&mut self) -> bool {
+        match self.lease_block() {
+            Some(reason) => {
+                self.push_log(Level::Warn, format!("Not done: {reason}."));
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn connect(&mut self) {
+        if !self.manual_refused() {
+            self.send_connect();
+        }
+    }
+
+    /// Connect to the GUI's selected display with the confirmed input mode
+    /// (the worker re-checks both before anything is drawn). Returns the
+    /// worker request acknowledged by `ConnectDone`.
+    fn send_connect(&mut self) -> Option<u64> {
         let Some(display) = self.config.output.display.clone() else {
             self.push_log(Level::Warn, "Select an output display first.");
-            return;
+            return None;
         };
         self.push_log(Level::Info, format!("Connecting to {}…", display.label()));
-        let _ = self.worker.send(Command::Connect {
-            backend: self.config.output.backend,
-            selection: Some(display),
-            mode: self.config.confirmed_mode(),
-            profile: self.config.profile.clone(),
-        });
+        let request = self.worker.request_id();
+        self.worker
+            .send(Command::Connect {
+                request,
+                backend: self.config.output.backend,
+                selection: Some(display),
+                mode: self.config.confirmed_mode(),
+                profile: self.config.profile.clone(),
+            })
+            .ok()?;
         self.device_state = DeviceState::Connecting;
+        Some(request)
     }
 
     pub fn disconnect(&mut self) {
+        if !self.manual_refused() {
+            self.send_disconnect();
+        }
+    }
+
+    /// The worker's reset-then-close path; acknowledged by `DisconnectDone`.
+    fn send_disconnect(&mut self) -> Option<u64> {
         self.queued_row = None;
         let request = self.worker.request_id();
         // A disconnect from `Disconnected` emits no state event, so only an
         // open (or opening/unknown) output is tracked as disconnecting.
-        if self.worker.send(Command::Disconnect { request }).is_ok() {
+        let sent = self.worker.send(Command::Disconnect { request }).is_ok();
+        if sent {
             self.disconnecting |= !matches!(self.device_state, DeviceState::Disconnected);
         }
         self.push_log(
             Level::Info,
             "Disconnect requested: reset pattern first, then close.",
         );
+        sent.then_some(request)
     }
 
     pub fn reset_pattern(&mut self) {
+        if !self.manual_refused() {
+            self.send_reset();
+        }
+    }
+
+    /// Show the uniform reset code; acknowledged by `Applied`/`ApplyFailed`.
+    fn send_reset(&mut self) -> Option<u64> {
+        if self.pending.is_some() {
+            return None;
+        }
         self.queued_row = None;
         let request = self.worker.request_id();
         let record = AppliedRecord {
@@ -766,10 +821,20 @@ impl App {
         };
         self.status = ApplyStatus::Applying(record.clone());
         self.pending = Some((request, record));
-        let _ = self.worker.send(Command::Reset { request });
+        if self.worker.send(Command::Reset { request }).is_err() {
+            self.pending = None;
+            return None;
+        }
+        Some(request)
     }
 
     pub fn apply_spec(&mut self, label: String, spec: PatternSpec) {
+        if !self.manual_refused() {
+            self.send_spec(label, spec);
+        }
+    }
+
+    fn send_spec(&mut self, label: String, spec: PatternSpec) -> Option<u64> {
         let profile = self.config.profile.generation;
         let record = AppliedRecord {
             label: label.clone(),
@@ -784,31 +849,38 @@ impl App {
                 label,
                 source: FrameSource::Generate { spec, profile },
             },
-        );
+        )
     }
 
-    fn send_apply(&mut self, record: AppliedRecord, item: ApplyItem) {
+    /// Returns the worker request acknowledged by `Applied`/`ApplyFailed`.
+    fn send_apply(&mut self, record: AppliedRecord, item: ApplyItem) -> Option<u64> {
         if self.pending.is_some() {
             self.push_log(
                 Level::Warn,
                 "A pattern is still being applied; wait for the result.",
             );
-            return;
+            return None;
         }
         self.queued_row = None;
         let request = self.worker.request_id();
         self.status = ApplyStatus::Applying(record.clone());
         self.pending = Some((request, record));
-        let _ = self.worker.send(Command::Apply { request, item });
+        if self.worker.send(Command::Apply { request, item }).is_err() {
+            self.pending = None;
+            return None;
+        }
+        Some(request)
     }
 
     pub fn apply_experiment_item(&mut self, index: usize) {
         if self.apply_block().is_some() {
             return;
         }
-        let Some(item) = self.experiment.experiment.items.get(index).cloned() else {
-            return;
-        };
+        self.send_experiment_item(index);
+    }
+
+    fn send_experiment_item(&mut self, index: usize) -> Option<u64> {
+        let item = self.experiment.experiment.items.get(index).cloned()?;
         self.set_selection(Some(index));
         self.reveal_row = Some(index);
         self.sweep_preview_row = true;
@@ -830,7 +902,7 @@ impl App {
                 label,
                 source: FrameSource::Experiment { item, asset },
             },
-        );
+        )
     }
 
     /// Index of the experiment item the worker reports as shown.
@@ -885,7 +957,9 @@ impl App {
             };
         } else {
             self.set_selection(Some(index));
-            if self.auto_apply_rows && self.connected() {
+            // While external control holds the device a click only selects;
+            // nothing is queued to fire after the lease ends.
+            if self.auto_apply_rows && self.connected() && self.lease_block().is_none() {
                 if self.pending.is_some() {
                     self.queued_row = Some(index);
                 } else {
@@ -1182,7 +1256,13 @@ impl App {
         .map(|reasons| slm_device::display::describe(&reasons))
     }
 
+    /// Why the manual Apply controls are disabled.
     fn apply_block(&self) -> Option<&'static str> {
+        self.lease_block().or_else(|| self.device_apply_block())
+    }
+
+    /// Why no pattern can be sent at all (manual or external).
+    fn device_apply_block(&self) -> Option<&'static str> {
         if self.pending.is_some() {
             Some("Applying… wait for the result")
         } else if matches!(self.device_state, DeviceState::Unknown { .. }) {
@@ -1532,6 +1612,10 @@ impl eframe::App for App {
         self.capture_step(ctx);
         if self.pending.is_some() || matches!(self.device_state, DeviceState::Connecting) {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        // Lease expiry is checked per frame; keep frames coming while leased.
+        if self.control.lease.is_some() || self.control.running().is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 

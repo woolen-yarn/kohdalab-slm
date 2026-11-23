@@ -1,12 +1,12 @@
-//! Opt-in (`--gui-api`), loopback-only, read-only GUI control adapter.
+//! Opt-in (`--gui-api`), loopback-only GUI control adapter.
 //!
 //! Same transport as KohdaLab Camera: one authenticated JSON Lines request per
 //! connection, queued to the GUI. The server thread never touches the App or
-//! the device worker; the GUI answers from a [`Snapshot`] of state it already
-//! holds for that frame. Only `control.describe`, `control.status` and
-//! `control.config` exist. There is no ownership, lease or writer: nothing
-//! here can connect, show a pattern, change the display or write the device.
-use kohdalab_control_protocol::{descriptor, is_common, prepare, response as common_response};
+//! the device worker. The GUI thread answers every request (`app/control.rs`):
+//! reads from a [`Snapshot`] of state it already holds for that frame, and
+//! mutations only under a writer lease (`control_lease.rs`), through the same
+//! worker commands, display interlock and reset/close path as the buttons.
+use kohdalab_control_protocol::{descriptor, response as common_response};
 use serde_json::{Value, json};
 use slm_device::AppConfig;
 use slm_device::backend::{BackendKind, ShowReceipt};
@@ -26,7 +26,33 @@ use std::{
 
 pub const APPLICATION: &str = "kohdalab-slm";
 pub const API_VERSION: u64 = 1;
-pub const METHODS: [&str; 3] = ["control.describe", "control.status", "control.config"];
+pub const METHODS: [&str; 12] = [
+    "control.describe",
+    "control.status",
+    "control.config",
+    "control.result",
+    "control.acquire",
+    "control.heartbeat",
+    "control.release",
+    "control.connect",
+    "control.apply",
+    "control.reset",
+    "control.disconnect",
+    "control.stop",
+];
+/// Methods that need a UUID `request_id`; all but `acquire` need the lease.
+pub const MUTATIONS: [&str; 8] = [
+    "acquire",
+    "heartbeat",
+    "release",
+    "connect",
+    "apply",
+    "reset",
+    "disconnect",
+    "stop",
+];
+/// What the reset frame is, stated wherever a reset is reported.
+pub const RESET_MEANING: &str = "uniform raw device code profile.reset_code (provisional 0); backend-confirmed draw only, not an optical measurement and not verified dark";
 const LIMIT: usize = 64 * 1024;
 const PEERS: usize = 4;
 const QUEUE: usize = 16;
@@ -188,7 +214,7 @@ impl Drop for Permit {
     }
 }
 
-fn error(code: &str, msg: &str) -> Value {
+pub(crate) fn error(code: &str, msg: &str) -> Value {
     json!({"ok":false,"error_code":code,"error":msg})
 }
 
@@ -315,11 +341,20 @@ pub struct Snapshot {
     /// because closing an unknown output does not verify what it shows.
     pub output_unverified: Option<String>,
     pub home: Option<PathBuf>,
+    /// A client holds the writer lease.
+    pub lease_owned: bool,
+    /// The lease operation (or lease-end cleanup) still waiting for its
+    /// worker acknowledgement: job ID and kind.
+    pub operation: Option<(String, &'static str)>,
+    /// That operation is a reset-then-close (stop/disconnect).
+    pub closing: bool,
+    /// Why the last lease ended (`released`, `expired`, …).
+    pub last_revocation: Option<&'static str>,
 }
 
 /// Free text (worker errors, labels) can name local files; never report the
 /// user's home directory.
-fn redact(text: &str, home: Option<&Path>) -> String {
+pub(crate) fn redact(text: &str, home: Option<&Path>) -> String {
     match home.and_then(Path::to_str).filter(|h| h.len() > 1) {
         Some(home) => text.replace(home, "~"),
         None => text.to_string(),
@@ -333,18 +368,35 @@ pub fn describe() -> Value {
         API_VERSION,
         &METHODS,
         json!({
-            "supports_ownership": false,
-            "exclusive_control": false,
-            "read_only": true,
+            "supports_ownership": true,
+            "exclusive_control": true,
+            "read_only": false,
+            // Only an explicit control.connect opens the output.
             "physical_auto_connect": false,
-            "device_writes": false,
+            // Patterns are shown on the SLM display; the USB wavelength is
+            // never written by the API.
+            "device_writes": true,
+            "wavelength_writes": false,
+            "stop_requires_lease": true,
+            "heartbeat_seconds": crate::control_lease::HEARTBEAT_SECONDS,
+            "lease_timeout_seconds": crate::control_lease::LEASE_TIMEOUT.as_secs_f64(),
+            "on_release": "stop",
+            "on_expiry": "stop",
+            "on_transport_loss": "stop",
+            "stop": "worker reset frame then close the output window",
+            "reset_pattern": RESET_MEANING,
+            "optical_state_verified": false,
+            "display_selection": "gui_only",
+            "input_mode_confirmation": "gui_only",
+            "serial_operations": true,
+            "takeover_blocked_while": ["lease_held", "operation_pending", "cleanup_pending", "output_unverified", "gui_busy"],
             "simulation_required_for_tests": true,
         }),
-        json!({"gui_owned": true, "external_control": "read_only"}),
+        json!({"gui_owned": true, "external_control": "lease"}),
     )
 }
 
-fn receipt_json(receipt: &ShowReceipt) -> Value {
+pub(crate) fn receipt_json(receipt: &ShowReceipt) -> Value {
     json!({
         "digest": receipt.digest,
         "uniform_code": receipt.uniform_code,
@@ -365,7 +417,7 @@ fn output_state(s: &Snapshot) -> &'static str {
         DeviceState::Unknown { .. } => "unknown",
         _ if s.output_unverified.is_some() => "unknown",
         DeviceState::Connecting => "pending",
-        _ if applying || s.disconnecting => "pending",
+        _ if applying || s.disconnecting || s.closing => "pending",
         DeviceState::Connected { .. } => "confirmed",
         DeviceState::Disconnected => "none",
     }
@@ -377,7 +429,8 @@ pub fn status(s: &Snapshot) -> Value {
     let output = output_state(s);
     let output_known = matches!(output, "confirmed" | "none");
     let (phase, device) = match &s.device {
-        _ if s.disconnecting => ("stopping", "disconnecting"),
+        _ if s.disconnecting || s.closing => ("stopping", "disconnecting"),
+        DeviceState::Disconnected if s.output_unverified.is_some() => ("error", "disconnected"),
         DeviceState::Disconnected => ("disconnected", "disconnected"),
         DeviceState::Connecting => ("initializing", "connecting"),
         DeviceState::Connected { .. } => ("ready", "connected"),
@@ -386,6 +439,7 @@ pub fn status(s: &Snapshot) -> Value {
     let busy = applying
         || s.disconnecting
         || s.wavelength_busy
+        || s.operation.is_some()
         || matches!(s.device, DeviceState::Connecting);
     // The worker's last confirmed frame is `showing` only while nothing newer
     // is pending or unverified; otherwise it is history (`previous_showing`).
@@ -430,10 +484,26 @@ pub fn status(s: &Snapshot) -> Value {
         (DeviceState::Unknown { reason }, _) | (_, Some(reason)) => json!(redact(reason, home)),
         _ => Value::Null,
     };
+    let external = if s.lease_owned {
+        "leased"
+    } else if s.operation.is_some() {
+        "cleanup_pending"
+    } else if output == "unknown" {
+        "output_unverified"
+    } else {
+        "available"
+    };
     kohdalab_control_protocol::status(
         phase,
         busy,
-        json!({"owned": false, "supported": false}),
+        // The lease token is a capability and never appears in status.
+        json!({
+            "owned": s.lease_owned,
+            "supported": true,
+            "heartbeat_seconds": crate::control_lease::HEARTBEAT_SECONDS,
+            "lease_timeout_seconds": crate::control_lease::LEASE_TIMEOUT.as_secs_f64(),
+            "last_revocation": s.last_revocation,
+        }),
         match output {
             "unknown" => "unknown",
             "pending" => "pending",
@@ -450,7 +520,10 @@ pub fn status(s: &Snapshot) -> Value {
             "previous_showing": previous,
             "last_apply": last,
             "wavelength_busy": s.wavelength_busy,
-            "external_control": "read_only",
+            "external_control": external,
+            "operation": s.operation.as_ref().map(|(id, kind)| json!({"job_id": id, "kind": kind})),
+            "reset_code": s.config.profile.reset_code,
+            "reset_meaning": RESET_MEANING,
         }),
     )
 }
@@ -496,31 +569,12 @@ pub fn config(s: &Snapshot) -> Value {
     })
 }
 
-/// Answer one authenticated request. Anything but the three read methods is
-/// refused with `unsupported` before any App state is consulted.
-pub fn respond(body: &Value, snapshot: impl FnOnce() -> Snapshot) -> Value {
-    let native = match prepare(body) {
-        Ok(native) => native,
-        Err(error) => return error,
-    };
-    let method = native
-        .get("_control_method")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let result = match method {
-        "describe" => json!({"ok": true, "result": describe()}),
-        "status" => json!({"ok": true, "result": status(&snapshot())}),
-        "config" => json!({"ok": true, "result": config(&snapshot())}),
-        _ => error(
-            "unsupported",
-            "KohdaLab SLM exposes read-only control.describe/status/config; use the GUI to connect or apply patterns",
-        ),
-    };
-    if is_common(body) {
-        common_response(body, result)
-    } else {
-        result
-    }
+/// Methods outside [`METHODS`] (and every native, non-`control.*` request).
+pub fn unsupported() -> Value {
+    error(
+        "unsupported",
+        "KohdaLab SLM supports only the control.* methods listed by control.describe",
+    )
 }
 
 /// A request whose deadline passed while queued is answered without work.
@@ -570,6 +624,10 @@ mod tests {
             disconnecting: false,
             output_unverified: None,
             home: Some(PathBuf::from("/Users/someone")),
+            lease_owned: false,
+            operation: None,
+            closing: false,
+            last_revocation: None,
         }
     }
 
@@ -598,42 +656,43 @@ mod tests {
     }
 
     #[test]
-    fn describe_advertises_only_read_methods_and_no_ownership() {
-        let r = respond(&common("control.describe"), || unreachable!());
-        assert_eq!(r["ok"], true);
-        assert_eq!(r["request_id"], "r1");
-        assert_eq!(r["result"]["application"], APPLICATION);
-        assert_eq!(r["result"]["methods"], json!(METHODS));
-        assert_eq!(r["result"]["safety"]["supports_ownership"], false);
-        assert_eq!(r["result"]["safety"]["read_only"], true);
-        assert_eq!(r["result"]["safety"]["physical_auto_connect"], false);
-    }
-
-    #[test]
-    fn mutations_and_ownership_are_refused_without_reading_state() {
-        for method in [
-            "control.connect",
-            "control.apply",
-            "control.start",
-            "control.stop",
-            "control.acquire",
-            "control.release",
-            "control.result",
-        ] {
-            let r = respond(&common(method), || panic!("{method} read state"));
-            assert_eq!(r["ok"], false, "{method}");
-            assert_eq!(r["error"]["code"], "unsupported", "{method}");
-            assert_eq!(r["error"]["retryable"], false);
+    fn describe_advertises_lease_methods_and_conservative_policy() {
+        let d = describe();
+        assert_eq!(d["application"], APPLICATION);
+        assert_eq!(d["methods"], json!(METHODS));
+        for m in MUTATIONS {
+            assert!(METHODS.contains(&format!("control.{m}").as_str()), "{m}");
         }
-        // Native (non control.*) requests are refused in the native envelope.
-        let r = respond(&json!({"method": "apply"}), || panic!("read state"));
-        assert_eq!(r["error_code"], "unsupported");
-        assert!(r.get("control_protocol").is_none());
+        let safety = &d["safety"];
+        assert_eq!(safety["supports_ownership"], true);
+        assert_eq!(safety["read_only"], false);
+        assert_eq!(safety["physical_auto_connect"], false);
+        assert_eq!(safety["wavelength_writes"], false);
+        assert_eq!(safety["stop_requires_lease"], true);
+        assert_eq!(safety["on_release"], "stop");
+        assert_eq!(safety["on_expiry"], "stop");
+        assert_eq!(safety["optical_state_verified"], false);
+        assert_eq!(safety["display_selection"], "gui_only");
+        // The SDK accepts heartbeat intervals of 0.1–2.0 s.
+        let hb = safety["heartbeat_seconds"].as_f64().unwrap();
+        assert!((0.1..=2.0).contains(&hb));
+        assert!(safety["lease_timeout_seconds"].as_f64().unwrap() > 2.0 * hb);
+        // No stop_on_error policy: the SDK sends no release reason by default.
+        assert!(safety.get("stop_policy_defaults").is_none());
+        assert!(
+            safety["reset_pattern"]
+                .as_str()
+                .unwrap()
+                .contains("not verified dark")
+        );
     }
 
     #[test]
     fn config_withholds_paths_device_ids_and_free_text() {
-        let r = respond(&common("control.config"), snapshot);
+        let r = common_response(
+            &common("control.config"),
+            json!({"ok": true, "result": config(&snapshot())}),
+        );
         let text = r.to_string();
         for secret in [
             "hunter2",
@@ -661,7 +720,10 @@ mod tests {
         assert_eq!(r["phase"], "disconnected");
         assert_eq!(r["busy"], false);
         assert_eq!(r["ownership"]["owned"], false);
+        assert_eq!(r["ownership"]["supported"], true);
         assert_eq!(r["cleanup"], "not_required");
+        assert_eq!(r["native"]["external_control"], "available");
+        assert_eq!(r["native"]["reset_code"], 0);
 
         s.device = DeviceState::Unknown {
             reason: "Display moved; see /Users/someone/x.log".into(),
@@ -683,11 +745,15 @@ mod tests {
         s.disconnecting = false;
         s.device = DeviceState::Disconnected;
         let r = status(&s);
-        assert_eq!(r["phase"], "disconnected");
+        // Conservative: an unverified closed output is an error phase, so a
+        // status-polling stop/release reports cleanup_unconfirmed.
+        assert_eq!(r["phase"], "error");
+        assert_eq!(r["native"]["device"], "disconnected");
         assert_eq!(r["busy"], false);
         assert_eq!(r["cleanup"], "unknown");
         assert_eq!(r["native"]["output"], "unknown");
         assert_eq!(r["native"]["unknown_reason"], "Display moved");
+        assert_eq!(r["native"]["external_control"], "output_unverified");
 
         // A confirmed connect (fresh receipt) is the positive event that clears it.
         s.output_unverified = None;
@@ -744,6 +810,19 @@ mod tests {
         assert_eq!(r["busy"], false);
         assert_eq!(r["native"]["output"], "confirmed");
         assert_eq!(r["native"]["showing"]["label"], "Reset");
+
+        // A leased stop waiting for its worker acknowledgement.
+        s.lease_owned = true;
+        s.operation = Some(("job".into(), "stop"));
+        s.closing = true;
+        let r = status(&s);
+        assert_eq!(r["busy"], true);
+        assert_eq!(r["phase"], "stopping");
+        assert_eq!(r["cleanup"], "pending");
+        assert_eq!(r["ownership"]["owned"], true);
+        assert_eq!(r["native"]["operation"]["kind"], "stop");
+        assert_eq!(r["native"]["external_control"], "leased");
+        assert!(!r.to_string().contains("lease\":\""), "no lease token");
     }
 
     #[test]
@@ -855,7 +934,10 @@ mod tests {
         let request = server.requests.recv_timeout(TIMEOUT).unwrap();
         request
             .reply
-            .send(respond(&request.body, || unreachable!()))
+            .send(common_response(
+                &request.body,
+                json!({"ok": true, "result": describe()}),
+            ))
             .unwrap();
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).unwrap();

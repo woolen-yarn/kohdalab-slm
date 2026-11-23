@@ -9,11 +9,13 @@
 //! - `--demo-smoke <new-dir>`: headless demo vertical slice; writes evidence
 //!   into a new directory and exits non-zero on any failed check
 //! - `--gui-api` (with no arguments, `--config <path>`, `--demo` or
-//!   `--demo-wavelength`): also start the read-only loopback control adapter;
-//!   see `docs/gui-control-api.md`
+//!   `--demo-wavelength`): also start the loopback control adapter (reads,
+//!   plus leased connect/apply/reset/disconnect/stop); see
+//!   `docs/gui-control-api.md`
 
 mod app;
 mod control_api;
+mod control_lease;
 #[cfg(test)]
 mod gui_tests;
 
