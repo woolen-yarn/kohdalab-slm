@@ -644,10 +644,69 @@ fn read_only_api_observes_demo_state_and_never_drives_the_device() {
         "only the GUI's own connect showed the reset frame"
     );
 
+    // Disconnect is in flight until the worker reports it: busy, output
+    // pending, and the prior receipt is not presented as current.
+    h.state_mut().disconnect();
+    assert!(h.state().disconnecting);
+    let snapshot = crate::control_api::status(&h.state().control_snapshot());
+    assert_eq!(snapshot["phase"], "stopping");
+    assert_eq!(snapshot["busy"], true);
+    assert_eq!(snapshot["cleanup"], "pending");
+    assert_eq!(snapshot["native"]["showing"], serde_json::Value::Null);
+    until(&mut h, "disconnected", |a| {
+        matches!(a.device_state, DeviceState::Disconnected) && !a.disconnecting
+    });
+    let status = query(
+        &mut h,
+        json!({"control_protocol":1,"method":"control.status"}),
+    );
+    assert_eq!(status["result"]["busy"], false);
+    assert_eq!(status["result"]["cleanup"], "not_required");
+
     let descriptor = h.state().control_api.as_ref().unwrap().descriptor.clone();
     drop(h);
     assert!(
         !descriptor.exists(),
         "descriptor removed when the app closes"
     );
+}
+
+#[test]
+fn ended_listener_clears_the_external_control_indicator() {
+    let run = tempfile::tempdir().unwrap();
+    let mut h = harness(true);
+    with_gui_api(&mut h, run.path());
+    h.get_by_label(crate::app::EXTERNAL_CONTROL);
+    let descriptor = h.state().control_api.as_ref().unwrap().descriptor.clone();
+    h.state().control_api.as_ref().unwrap().stop_listener();
+    until(&mut h, "server dropped", |a| a.control_api.is_none());
+    h.run_steps(2);
+    assert!(h.query_by_label(crate::app::EXTERNAL_CONTROL).is_none());
+    assert!(!descriptor.exists(), "descriptor withdrawn");
+}
+
+#[test]
+fn unknown_output_survives_disconnect_until_a_confirmed_connect() {
+    let mut h = harness(true);
+    until(&mut h, "display list", |a| !a.displays.is_empty());
+    h.get_by_label("Connect").click();
+    until(&mut h, "connected", |a| a.connected());
+    // Invalidate the demo output, as a moved or lost display would.
+    h.state().demo_control.lock().pending_invalidation = Some("Display moved.".into());
+    until(&mut h, "output unknown", |a| !a.connected());
+    h.state_mut().disconnect();
+    until(&mut h, "disconnected", |a| {
+        matches!(a.device_state, DeviceState::Disconnected) && !a.disconnecting
+    });
+    let s = crate::control_api::status(&h.state().control_snapshot());
+    assert_eq!(
+        s["cleanup"], "unknown",
+        "closing does not verify the output"
+    );
+    assert_eq!(s["native"]["output"], "unknown");
+    h.state_mut().connect();
+    until(&mut h, "reconnected", |a| a.connected());
+    let s = crate::control_api::status(&h.state().control_snapshot());
+    assert_eq!(s["cleanup"], "not_required");
+    assert_eq!(s["native"]["output"], "confirmed");
 }

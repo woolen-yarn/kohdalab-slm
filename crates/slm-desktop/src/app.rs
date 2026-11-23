@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod ui;
+#[cfg(test)]
 pub(crate) use ui::EXTERNAL_CONTROL;
 
 const MAX_LOG: usize = 500;
@@ -229,6 +230,10 @@ pub struct App {
     sweep_check: std::cell::RefCell<Option<(String, Result<(), String>)>>,
     /// Read-only external control (`--gui-api`); `None` in standalone use.
     pub control_api: Option<crate::control_api::Server>,
+    /// Disconnect sent; cleared when the worker reports `Disconnected`.
+    pub disconnecting: bool,
+    /// Why the output became unknown; cleared only by a confirmed draw.
+    pub output_unverified: Option<String>,
 }
 
 #[derive(Default)]
@@ -376,6 +381,8 @@ impl App {
             window_fit: WindowFitState::default(),
             sweep_check: std::cell::RefCell::new(None),
             control_api: None,
+            disconnecting: false,
+            output_unverified: None,
             capture: options.capture.map(|path| Capture {
                 path,
                 ..Default::default()
@@ -413,10 +420,12 @@ impl App {
 
     /// Read-only external control is active (shown in the tab row).
     pub fn external_control(&self) -> bool {
-        self.control_api.is_some()
+        self.control_api
+            .as_ref()
+            .is_some_and(crate::control_api::Server::is_active)
     }
 
-    fn control_snapshot(&self) -> crate::control_api::Snapshot {
+    pub(crate) fn control_snapshot(&self) -> crate::control_api::Snapshot {
         use crate::control_api::LastApply;
         crate::control_api::Snapshot {
             demo: self.demo,
@@ -442,6 +451,8 @@ impl App {
                 },
             },
             wavelength_busy: self.wavelength_busy,
+            disconnecting: self.disconnecting,
+            output_unverified: self.output_unverified.clone(),
             home: slm_device::config::home_dir(),
         }
     }
@@ -449,6 +460,20 @@ impl App {
     /// Answer queued read-only requests from this frame's GUI state. Never
     /// sends a worker command and never changes App state.
     pub fn process_control_api(&mut self) {
+        // A listener that ended (permanent accept error) has already withdrawn
+        // its descriptor; drop it so no active indicator remains.
+        if self
+            .control_api
+            .as_ref()
+            .is_some_and(|api| !api.is_active())
+        {
+            self.control_api = None;
+            self.push_log(
+                Level::Warn,
+                "External control stopped: GUI API listener ended.",
+            );
+            return;
+        }
         let requests: Vec<_> = self
             .control_api
             .as_ref()
@@ -593,6 +618,17 @@ impl App {
                             };
                         }
                         self.push_log(Level::Error, format!("Output unknown: {reason}"));
+                        self.output_unverified = Some(reason.clone());
+                    }
+                    match &state {
+                        // Disconnect ends here (also when it was a no-op
+                        // after a refused connect).
+                        DeviceState::Disconnected => self.disconnecting = false,
+                        // Connect and apply emit `Connected` only after the
+                        // backend confirmed the frame: the one positive event
+                        // that clears an unknown output.
+                        DeviceState::Connected { .. } => self.output_unverified = None,
+                        _ => {}
                     }
                     self.device_state = state;
                 }
@@ -645,6 +681,9 @@ impl App {
                             }
                         ),
                     );
+                    if !output_known && self.output_unverified.is_none() {
+                        self.output_unverified = Some(error.clone());
+                    }
                     self.status = ApplyStatus::Failed {
                         record,
                         error,
@@ -703,7 +742,11 @@ impl App {
     pub fn disconnect(&mut self) {
         self.queued_row = None;
         let request = self.worker.request_id();
-        let _ = self.worker.send(Command::Disconnect { request });
+        // A disconnect from `Disconnected` emits no state event, so only an
+        // open (or opening/unknown) output is tracked as disconnecting.
+        if self.worker.send(Command::Disconnect { request }).is_ok() {
+            self.disconnecting |= !matches!(self.device_state, DeviceState::Disconnected);
+        }
         self.push_log(
             Level::Info,
             "Disconnect requested: reset pattern first, then close.",

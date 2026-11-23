@@ -6,6 +6,7 @@ the same transport as KohdaLab Camera. It is **off by default**. Without
 
 ```sh
 kohdalab-slm --gui-api --demo            # simulated output, temporary config
+kohdalab-slm --gui-api --demo-wavelength # same, opened on the wavelength view
 kohdalab-slm --gui-api                   # normal GUI, ~/.kohdalab/slm/config/config.json
 kohdalab-slm --gui-api --config <path>
 ```
@@ -48,8 +49,19 @@ after closing a modal file dialog.
 | Method | Result |
 | --- | --- |
 | `control.describe` | Application, version, `methods` (only these three), `safety` (`supports_ownership: false`, `read_only: true`, `physical_auto_connect: false`, `device_writes: false`) |
-| `control.status` | `phase` (`disconnected`, `initializing`, `ready`, `error`), `busy` (applying, connecting or a wavelength operation in progress), `ownership: {owned: false, supported: false}`, `cleanup` (`not_required`, or `unknown` when the SLM output may be in another state), and `native` (demo/simulated flags, device state, the shown pattern and its receipt, last apply outcome, unknown-output reason) |
+| `control.status` | `phase` (`disconnected`, `initializing`, `ready`, `stopping` while a disconnect is in flight, `error`), `busy` (connecting, applying, disconnecting or a wavelength operation in progress), `ownership: {owned: false, supported: false}`, `cleanup` (see below), and `native` (demo/simulated flags, device state, `output`, the confirmed pattern and its receipt, last apply outcome, unknown-output reason) |
 | `control.config` | The GUI's in-memory configuration. `saved: false` means it has unsaved edits. Includes profile values, backend, the selected display (name, GDI name, size) and the confirmed input mode |
+
+`native.output` and `cleanup` are conservative:
+
+| `native.output` | `cleanup` | Meaning |
+| --- | --- | --- |
+| `confirmed` | `not_required` | Connected and the backend confirmed the frame in `native.showing` |
+| `none` | `not_required` | Disconnected, with no unresolved unknown output. What the SLM shows after closing is not verified optically |
+| `pending` | `pending` | A connect, apply/reset or disconnect is in flight. `native.showing` is `null`; the last confirmed frame is in `native.previous_showing` and may no longer be shown |
+| `unknown` | `unknown` | A draw failed or the display was lost. This stays `unknown` after a disconnect, since closing does not verify the output. Only a backend-confirmed connect or apply clears it |
+
+`native.output_known` is `true` only for `confirmed` and `none`.
 
 Any other method, including connect, apply, start, stop, acquire and release,
 returns `error.code: "unsupported"`. The adapter does not read any app
@@ -71,6 +83,9 @@ directory with `~`. The token appears only in the descriptor file.
 - There is no writer lease, so the GUI shows **External control · Read only**
   in the tab row and no Take control or Stop button. Camera shows the same
   indicator.
+- If the listener ends (a permanent socket error), the app removes the
+  descriptor, hides the indicator and logs a warning. Restart the app with
+  `--gui-api` to start the API again.
 - `phase: "ready"` and a receipt mean the backend confirmed the draw (demo:
   encoding round-trip; Windows: desktop readback). They do not prove the
   optical response of the SLM.
@@ -81,7 +96,10 @@ GUI でのみ行います。所有権（リース）がないため、「制御�
 
 ## Tests / テスト
 
-These tests need no hardware: `cargo test -p kohdalab-slm control_api` and
-`cargo test -p kohdalab-slm read_only_api`. The second runs the real App on
-the demo backend. Its server writes to a temporary run directory, never to
-`~/.kohdalab`.
+These tests need no hardware: `cargo test -p kohdalab-slm control_api`,
+`cargo test -p kohdalab-slm read_only_api`, `cargo test -p kohdalab-slm
+ended_listener` and `cargo test -p kohdalab-slm unknown_output`. The last
+three run the real App on the demo backend. Their servers write to a
+temporary run directory, never to `~/.kohdalab`. The Python SDK tests run
+with `python -m unittest -v test_control` from `bindings/control`; CI runs
+both.

@@ -65,10 +65,10 @@ kohdalab-slm --demo                # simulated output only, temporary config
 kohdalab-slm --demo-wavelength     # demo with wavelength controls open
 kohdalab-slm --demo-capture <png> [w h [tab [expanded]]]  # demo check: connect, apply, sweep, step through the list, screenshot own window, close
 kohdalab-slm --demo-smoke <dir>    # headless demo vertical slice; writes evidence to a new dir
-kohdalab-slm --gui-api [--demo | --config <path>]  # also start the read-only GUI API
+kohdalab-slm --gui-api [--demo | --demo-wavelength | --config <path>]  # also start the read-only GUI API
 ```
 
-`--demo`, `--demo-capture` and `--demo-smoke` only create the demo backend; they never
+`--demo`, `--demo-wavelength`, `--demo-capture` and `--demo-smoke` only create the demo backend; they never
 enumerate real displays or open an output window.
 
 `--gui-api` is opt-in. It starts a loopback-only, read-only control adapter

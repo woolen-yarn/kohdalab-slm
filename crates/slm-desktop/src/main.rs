@@ -8,8 +8,9 @@
 //!   output, steps through the list, saves a screenshot of this window, closes
 //! - `--demo-smoke <new-dir>`: headless demo vertical slice; writes evidence
 //!   into a new directory and exits non-zero on any failed check
-//! - `--gui-api` (with no arguments, `--config <path>` or `--demo`): also start
-//!   the read-only loopback control adapter; see `docs/gui-control-api.md`
+//! - `--gui-api` (with no arguments, `--config <path>`, `--demo` or
+//!   `--demo-wavelength`): also start the read-only loopback control adapter;
+//!   see `docs/gui-control-api.md`
 
 mod app;
 mod control_api;
@@ -88,7 +89,7 @@ fn main() {
     };
     let result = match args.as_slice() {
         _ if gui_api && !interactive => {
-            Err("--gui-api combines only with no arguments, --config <path> or --demo".into())
+            Err("--gui-api works only with no args, --config <path>, --demo[-wavelength]".into())
         }
         [] => match slm_device::config::default_config_path() {
             Some(config_path) => run_gui(app::AppOptions {
@@ -154,7 +155,7 @@ fn main() {
             }
         }
         [flag, dir] if flag == "--demo-smoke" => smoke::run(&PathBuf::from(dir)),
-        _ => Err("Usage: kohdalab-slm [--gui-api] [--demo | --config <path>] | --demo-capture <png> [w h] | --demo-smoke <new-dir>".into()),
+        _ => Err("Usage: kohdalab-slm [--gui-api] [--demo | --demo-wavelength | --config <path>] | --demo-capture <png> [w h] | --demo-smoke <new-dir>".into()),
     };
     if let Err(e) = result {
         eprintln!("{e}");
