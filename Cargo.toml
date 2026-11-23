@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/slm-core", "crates/slm-device", "crates/slm-desktop"]
+members = [
+    "crates/slm-core",
+    "crates/slm-device",
+    "crates/slm-desktop",
+    # Unmodified copy of the suite's shared crate; do not edit it here.
+    "crates/kohdalab-control-protocol",
+]
 resolver = "3"
 
 [workspace.package]

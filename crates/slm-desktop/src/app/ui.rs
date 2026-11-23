@@ -14,6 +14,17 @@ const GREEN: Color32 = Color32::from_rgb(100, 196, 146);
 const HEADER_FILL: Color32 = Color32::from_rgb(45, 46, 52);
 const ROW: f32 = 32.;
 const H: f32 = 26.;
+/// Prefix of every External control state label in the tab row.
+#[cfg(test)]
+pub(crate) const EXTERNAL_CONTROL: &str = "External control";
+const EXTERNAL_AVAILABLE: &str = "External control · Available";
+pub(crate) const EXTERNAL_LEASED: &str = "External control · Python";
+const EXTERNAL_WAITING: &str = "External control · Waiting for device";
+const EXTERNAL_UNVERIFIED: &str = "External control · Output unverified";
+const EXTERNAL_AVAILABLE_TIP: &str = "Started with --gui-api. A local client can acquire a lease to connect to the selected display, apply patterns, reset and stop. While it holds the lease, manual output controls here are locked; Stop and Take control stay available.";
+const EXTERNAL_LEASED_TIP: &str = "A local client holds the SLM lease. Stop: end the lease, send the reset pattern, then close the output. Take control: end the lease and leave the output as it is.";
+const EXTERNAL_WAITING_TIP: &str = "Waiting for the device to acknowledge the last external operation or its stop. A new lease is refused until then.";
+const EXTERNAL_UNVERIFIED_TIP: &str = "The SLM output is unverified. A new lease is refused until a backend-confirmed Connect in this window.";
 
 impl App {
     pub(super) fn draw(&mut self, root: &mut egui::Ui) {
@@ -147,6 +158,7 @@ impl App {
         let inner = w - 22.;
         let half = ((inner - 8.) / 2.).round();
         let busy = self.device_busy();
+        let can_open_file_dialog = !self.demo && self.lease_block().is_none();
         let (browse, load, save);
         {
             let mut f = Form::new(ui, origin);
@@ -156,7 +168,7 @@ impl App {
                 rect(11., 27., inner - 78., H),
                 &mut self.config_path_text,
             );
-            browse = f.button(rect(w - 81., 27., 70., H), "Browse", !self.demo);
+            browse = f.button(rect(w - 81., 27., 70., H), "Browse", can_open_file_dialog);
             load = f.button_with(
                 rect(11., 59., half, H),
                 "Load",
@@ -171,7 +183,7 @@ impl App {
             save = f.button_with(
                 rect(19. + half, 59., inner - 8. - half, H),
                 "Save",
-                !self.demo,
+                can_open_file_dialog,
                 Tone::Neutral,
                 Some(if self.demo {
                     "Demo config is temporary"
@@ -238,7 +250,8 @@ impl App {
         let busy = self.device_busy();
         let connected = self.connected();
         let (caption, caption_color) = self.state_caption();
-        let block = self.connect_block();
+        let leased = self.lease_block();
+        let block = leased.map(String::from).or_else(|| self.connect_block());
         // Height is known only after laying out; paint the card first with the
         // previous frame's height so content draws on top of it.
         let id = egui::Id::new("slm-card-height");
@@ -474,9 +487,10 @@ impl App {
             matches!(
                 self.device_state,
                 DeviceState::Connected { .. } | DeviceState::Unknown { .. }
-            ) && self.pending.is_none(),
+            ) && self.pending.is_none()
+                && leased.is_none(),
             Tone::Neutral,
-            Some("Send the reset pattern, then close the output"),
+            Some(leased.unwrap_or("Send the reset pattern, then close the output")),
         );
         let settings = f.button_with(
             rect(action_x, y, col_width, H),
@@ -496,12 +510,14 @@ impl App {
         let reset = f.button_with(
             rect(action_x, y, col_width, H),
             "Reset Pattern",
-            connected && self.pending.is_none(),
+            connected && self.pending.is_none() && leased.is_none(),
             Tone::Neutral,
-            Some(&format!(
-                "Show uniform code {} now",
-                self.config.profile.reset_code
-            )),
+            Some(&leased.map(String::from).unwrap_or_else(|| {
+                format!(
+                    "Show uniform raw code {} now (not verified dark)",
+                    self.config.profile.reset_code
+                )
+            })),
         );
         y += ROW;
 
@@ -755,6 +771,57 @@ impl App {
             }
             x += widths[i];
         }
+        if self.external_control() {
+            // Restrained state text as in Camera, with Stop (always) and
+            // Take control (while a client holds the lease).
+            let leased = self.control.lease.is_some();
+            let (text, color, tip) = if leased {
+                (EXTERNAL_LEASED, AMBER, EXTERNAL_LEASED_TIP)
+            } else if self.control.running().is_some() {
+                (EXTERNAL_WAITING, AMBER, EXTERNAL_WAITING_TIP)
+            } else if self.output_unverified.is_some()
+                || matches!(self.device_state, DeviceState::Unknown { .. })
+            {
+                (EXTERNAL_UNVERIFIED, ERROR, EXTERNAL_UNVERIFIED_TIP)
+            } else {
+                (EXTERNAL_AVAILABLE, MUTED, EXTERNAL_AVAILABLE_TIP)
+            };
+            let can_stop = leased || !matches!(self.device_state, DeviceState::Disconnected);
+            let (mut stop, mut take) = (false, false);
+            let w = 400_f32.min((area.max.x - x - 8.).max(0.));
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rect(area.max.x - w - 6., area.min.y, w, 24.))
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                |ui| {
+                    fn button(label: &str) -> egui::Button<'static> {
+                        egui::Button::new(RichText::new(label).size(12.))
+                            .min_size(Vec2::new(0., 22.))
+                            .corner_radius(6)
+                    }
+                    stop = ui
+                        .add_enabled(can_stop, button("Stop"))
+                        .on_hover_text(
+                            "End any external lease, send the reset pattern, then close the output",
+                        )
+                        .on_disabled_hover_text("Nothing to stop: disconnected and no lease")
+                        .clicked();
+                    take = ui
+                        .add_enabled(leased, button("Take control"))
+                        .on_hover_text("End the external lease; the output stays as it is")
+                        .on_disabled_hover_text("No client holds the lease")
+                        .clicked();
+                    ui.add(egui::Label::new(RichText::new(text).size(12.).color(color)).truncate())
+                        .on_hover_text(tip);
+                },
+            );
+            if stop {
+                self.gui_stop();
+            }
+            if take {
+                self.gui_take_control();
+            }
+        }
         let page = rect(
             area.min.x + 2.,
             area.min.y + 26.,
@@ -903,7 +970,7 @@ impl App {
             if f.button_with(
                 rect(px, save_y, bw, H),
                 label,
-                can_save,
+                can_save && self.lease_block().is_none(),
                 Tone::Neutral,
                 Some("Save the current Input Pattern"),
             ) {
@@ -1364,6 +1431,7 @@ impl App {
             .path
             .as_ref()
             .map_or_else(|| "Not saved".to_string(), |p| p.display().to_string());
+        let can_open_file_dialog = self.lease_block().is_none();
         let mut f = Form::new(ui, origin);
         f.label(rect(9., 9., 66., H), "Name");
         f.text(
@@ -1380,15 +1448,16 @@ impl App {
         let buttons = ["New List", "Open List…", "Save List", "Save List As…"];
         let mut clicked = None;
         for (i, name) in buttons.iter().enumerate() {
-            if f.button(rect(81. + i as f32 * (bw + 6.), 73., bw, H), name, true) {
+            let enabled = i == 0 || can_open_file_dialog;
+            if f.button(rect(81. + i as f32 * (bw + 6.), 73., bw, H), name, enabled) {
                 clicked = Some(*name);
             }
         }
-        let import = f.button(rect(81., 105., bw, H), "Import CSV…", true);
+        let import = f.button(rect(81., 105., bw, H), "Import CSV…", can_open_file_dialog);
         let export = f.button(
             rect(81. + bw + 6., 105., bw, H),
             "Export…",
-            !self.experiment.experiment.items.is_empty(),
+            can_open_file_dialog && !self.experiment.experiment.items.is_empty(),
         );
         f.label(rect(9., 137., 66., H), "PNG");
         let mut x = 81.;
@@ -1414,7 +1483,12 @@ impl App {
                 "Unsaved list changes will be lost.",
                 AMBER,
             );
-            if f.button(rect(255., 169., 140., H), "Discard and Continue", true) {
+            let can_discard = matches!(action, Discard::New) || can_open_file_dialog;
+            if f.button(
+                rect(255., 169., 140., H),
+                "Discard and Continue",
+                can_discard,
+            ) {
                 discard = Some(action);
             }
             if f.button(rect(401., 169., 70., H), "Cancel", true) {

@@ -1,0 +1,123 @@
+name: Package SLM
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libegl1-mesa libgl1-mesa-dri libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev xvfb xauth
+      - name: Locate Windows resource compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\rc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $rc) { throw 'Windows SDK resource compiler not found' }
+          "RC=$($rc.FullName)" >> $env:GITHUB_ENV
+      - name: Build release and stage the Python SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal --target "$TARGET"
+          cargo build --release --locked --target "$TARGET" --bin kohdalab-slm
+          binary="target/$TARGET/release/kohdalab-slm"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          python --version
+          python packaging/prepare_payload.py "$binary" payload --target "$TARGET"
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          echo "SLM_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build and validate Windows portable and Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory dist, portable | Out-Null
+          $name = "kohdalab-slm-$env:SLM_VERSION-windows-x64"
+          $setup = Join-Path $PWD "dist\KohdaLab-SLM-$env:SLM_VERSION-Setup.exe"
+          Compress-Archive -Path 'payload\*' -DestinationPath "dist\$name-portable.zip"
+          Expand-Archive "dist\$name-portable.zip" portable
+          python packaging/smoke.py portable/kohdalab-slm.exe --headless
+          if ($LASTEXITCODE) { throw 'Portable demo failed' }
+          python packaging/fetch_nsis.py --output "$env:RUNNER_TEMP/slm-nsis"
+          if ($LASTEXITCODE) { throw 'NSIS fetch failed' }
+          & "$env:RUNNER_TEMP/slm-nsis/nsis-3.12/Bin/makensis.exe" "/DVERSION=$env:SLM_VERSION" "/DOUTPUT=$setup" "/DPAYLOAD=$PWD\payload" packaging/setup.nsi
+          if ($LASTEXITCODE) { throw 'Setup build failed' }
+          $configDir = Join-Path $env:USERPROFILE '.kohdalab\slm\config'
+          New-Item -ItemType Directory -Force $configDir | Out-Null
+          $config = Join-Path $configDir 'config.json'
+          if (Test-Path $config) { throw 'Test runner is not clean' }
+          Set-Content $config 'config-preservation-sentinel'
+          $before = (Get-FileHash $config).Hash
+          $installed = Join-Path $env:ProgramFiles 'Kohdalab\KohdaLab SLM'
+          $process = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode) { throw 'Setup installation failed' }
+          $actual = (Get-FileHash "$installed\kohdalab-slm.exe").Hash
+          $expected = (Get-FileHash 'portable\kohdalab-slm.exe').Hash
+          if ($actual -ne $expected) { throw 'Setup binary differs from portable' }
+          if (!(Test-Path "$installed\bindings\control\kohdalab_control.py")) { throw 'SDK missing from Setup' }
+          python packaging/smoke.py "$installed\kohdalab-slm.exe" --headless
+          if ($LASTEXITCODE) { throw 'Installed demo failed' }
+          $process = Start-Process "$installed\Uninstall KohdaLab SLM.exe" -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -or (Test-Path "$installed\kohdalab-slm.exe")) { throw 'Uninstaller failed' }
+          if ((Get-FileHash $config).Hash -ne $before) { throw 'Setup or uninstall changed config' }
+      - name: Build and validate macOS and Linux packages
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/package_unix.sh payload dist "$SLM_VERSION"
+          mkdir extracted
+          if [ "$RUNNER_OS" = macOS ]; then
+            ditto -x -k dist/*-portable.zip extracted
+            codesign --verify --strict 'extracted/KohdaLab SLM.app'
+            hdiutil verify dist/*.dmg
+            volume=$(mktemp -d)
+            hdiutil attach -readonly -nobrowse -mountpoint "$volume" dist/*.dmg
+            trap 'hdiutil detach "$volume"' EXIT
+            cmp "$volume/KohdaLab SLM.app/Contents/MacOS/kohdalab-slm" 'extracted/KohdaLab SLM.app/Contents/MacOS/kohdalab-slm'
+            python packaging/smoke.py 'extracted/KohdaLab SLM.app/Contents/MacOS/kohdalab-slm'
+          else
+            mkdir portable
+            tar -xzf dist/*-portable.tar.gz -C portable --strip-components=1
+            dpkg-deb -x dist/*.deb extracted
+            cmp portable/kohdalab-slm extracted/usr/bin/kohdalab-slm
+            sudo apt-get install -y "$PWD"/dist/*.deb
+            LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a -s '-screen 0 1920x1080x24 +extension GLX' python packaging/smoke.py /usr/bin/kohdalab-slm
+          fi
+      - name: Upload verified packages for release review
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: slm-${{ runner.os }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 2
