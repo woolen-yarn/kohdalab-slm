@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod ui;
+pub(crate) use ui::EXTERNAL_CONTROL;
 
 const MAX_LOG: usize = 500;
 
@@ -156,6 +157,9 @@ pub struct AppOptions {
     /// Demo launch check: connect, apply one pattern, save a screenshot of
     /// this window to the path, then close.
     pub capture: Option<PathBuf>,
+    /// `--gui-api`: start the read-only loopback control adapter. Off by
+    /// default; nothing is bound or written unless this is set.
+    pub gui_api: bool,
 }
 
 #[derive(Debug, Default)]
@@ -223,6 +227,8 @@ pub struct App {
     /// Full per-value validation of the sweep draft, keyed by the draft and
     /// profile so it is recomputed only after an edit.
     sweep_check: std::cell::RefCell<Option<(String, Result<(), String>)>>,
+    /// Read-only external control (`--gui-api`); `None` in standalone use.
+    pub control_api: Option<crate::control_api::Server>,
 }
 
 #[derive(Default)]
@@ -369,6 +375,7 @@ impl App {
             sweep_preview_row: false,
             window_fit: WindowFitState::default(),
             sweep_check: std::cell::RefCell::new(None),
+            control_api: None,
             capture: options.capture.map(|path| Capture {
                 path,
                 ..Default::default()
@@ -387,8 +394,74 @@ impl App {
                 format!("Config: {}", app.config_path.display())
             },
         );
+        if options.gui_api {
+            let wake = ctx.clone();
+            match crate::control_api::Server::start(None, move || wake.request_repaint()) {
+                Ok(server) => {
+                    app.control_api = Some(server);
+                    app.push_log(
+                        Level::Info,
+                        "External control: read-only GUI API on loopback (describe/status/config).",
+                    );
+                }
+                Err(e) => app.push_log(Level::Warn, format!("GUI API not started: {e}")),
+            }
+        }
         app.refresh_displays();
         app
+    }
+
+    /// Read-only external control is active (shown in the tab row).
+    pub fn external_control(&self) -> bool {
+        self.control_api.is_some()
+    }
+
+    fn control_snapshot(&self) -> crate::control_api::Snapshot {
+        use crate::control_api::LastApply;
+        crate::control_api::Snapshot {
+            demo: self.demo,
+            config: self.config.clone(),
+            config_saved: !self.config_dirty,
+            device: self.device_state.clone(),
+            last_apply: match &self.status {
+                ApplyStatus::Idle => LastApply::Idle,
+                ApplyStatus::Applying(r) => LastApply::Applying {
+                    label: r.label.clone(),
+                },
+                ApplyStatus::Applied(r, _) => LastApply::Applied {
+                    label: r.label.clone(),
+                },
+                ApplyStatus::Failed {
+                    record,
+                    error,
+                    output_known,
+                } => LastApply::Failed {
+                    label: record.label.clone(),
+                    error: error.clone(),
+                    output_known: *output_known,
+                },
+            },
+            wavelength_busy: self.wavelength_busy,
+            home: slm_device::config::home_dir(),
+        }
+    }
+
+    /// Answer queued read-only requests from this frame's GUI state. Never
+    /// sends a worker command and never changes App state.
+    pub fn process_control_api(&mut self) {
+        let requests: Vec<_> = self
+            .control_api
+            .as_ref()
+            .map(|api| api.requests.try_iter().take(8).collect())
+            .unwrap_or_default();
+        for request in requests {
+            let value = if request.deadline < std::time::Instant::now() {
+                crate::control_api::expired(&request.body)
+            } else {
+                crate::control_api::respond(&request.body, || self.control_snapshot())
+            };
+            let _ = request.reply.send(value);
+        }
     }
 
     pub fn push_log(&mut self, level: Level, text: impl Into<String>) {
@@ -1396,6 +1469,8 @@ impl eframe::App for App {
         }
         self.fit_window_once(ctx);
         self.process_events();
+        // After worker events, so status reflects this frame's device state.
+        self.process_control_api();
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.wavelength_busy {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

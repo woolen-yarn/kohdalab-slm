@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 slm-core.workspace = true
 slm-device.workspace = true
+kohdalab-control-protocol = { path = "../kohdalab-control-protocol" }
+uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

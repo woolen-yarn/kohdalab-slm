@@ -14,6 +14,8 @@ const GREEN: Color32 = Color32::from_rgb(100, 196, 146);
 const HEADER_FILL: Color32 = Color32::from_rgb(45, 46, 52);
 const ROW: f32 = 32.;
 const H: f32 = 26.;
+pub(crate) const EXTERNAL_CONTROL: &str = "External control · Read only";
+const EXTERNAL_CONTROL_TIP: &str = "Started with --gui-api. Local clients can read describe, status and config. They cannot connect, apply patterns or change settings; this window keeps full control.";
 
 impl App {
     pub(super) fn draw(&mut self, root: &mut egui::Ui) {
@@ -754,6 +756,23 @@ impl App {
                 self.unit_error = None;
             }
             x += widths[i];
+        }
+        if self.external_control() {
+            // Same restrained wording as Camera; no take-control or stop
+            // button because the API has no writer lease.
+            let w = 200_f32.min((area.max.x - x - 8.).max(0.));
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rect(area.max.x - w - 6., area.min.y, w, 24.))
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(EXTERNAL_CONTROL).size(12.).color(MUTED))
+                            .truncate(),
+                    )
+                    .on_hover_text(EXTERNAL_CONTROL_TIP);
+                },
+            );
         }
         let page = rect(
             area.min.x + 2.,

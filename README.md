@@ -28,6 +28,7 @@ Agreed specification: [`kohdalab-slm-design.md`](kohdalab-slm-design.md).
 |---|---|
 | `crates/slm-core` | Units (px / µm / µm⁻¹, deg / rad / π), Uniform / Single Wave / Multi-Wave generation, one-axis sweeps, experiment JSON, Santec `Y/X` CSV, heatmap PNG. Phase (`PhaseFrame`) and device codes (`CodeFrame`, `u16`) are separate types. |
 | `crates/slm-device` | Device profile, config, display identity checks, 10-bit RGB encoding, demo and Windows backends, and the single serialized device worker. |
+| `crates/kohdalab-control-protocol` | Unmodified copy of the suite's shared KohdaLab Control Protocol 1 crate (device-free envelope helpers). Do not edit it here; update the shared source. |
 | `crates/slm-desktop` | `kohdalab-slm` GUI in the KohdaLab TRKR layout (default 1566 × 900, full-layout minimum width 1566). Left: Config, SLM card on TRKR's device-card grid (Device, Display + Refresh, **Connect | Disconnect | Settings**, Reset Pattern row; **Settings** opens a separate window with pitch, magnification, mount angle, phase0/code period, default band width and center, wavelength, reset code), and a Patterns list shared by every tab. Center: tabs with one form card (pattern inputs only) plus Output/Run, above the **Input Pattern** heatmap (SLM codes of the current input, rendered off the UI thread by the same `render`/`render_item` as a send; preview-only grayscale, code 0 black to the device max code white, linear and fixed; code range and frame hash on hover; square pixels; axes follow the image columns/rows, x right and y down, with (0, 0) always at the exact image center on every tab, independent of Center X/Y, rotation and pattern kind, which only change the generated codes; ticks at pixel centers in px, or in sample-plane µm (pitch × magnification) when a period is entered in µm or µm⁻¹; a small open reticle marks the center and is drawn over the image, not into it. PNG export keeps its own color maps). Right: Log above the applied-condition Field/Value table. `<`/`>` column toggles. |
 
 ## Build and run / ビルドと起動
@@ -64,10 +65,19 @@ kohdalab-slm --demo                # simulated output only, temporary config
 kohdalab-slm --demo-wavelength     # demo with wavelength controls open
 kohdalab-slm --demo-capture <png> [w h [tab [expanded]]]  # demo check: connect, apply, sweep, step through the list, screenshot own window, close
 kohdalab-slm --demo-smoke <dir>    # headless demo vertical slice; writes evidence to a new dir
+kohdalab-slm --gui-api [--demo | --config <path>]  # also start the read-only GUI API
 ```
 
 `--demo`, `--demo-capture` and `--demo-smoke` only create the demo backend; they never
 enumerate real displays or open an output window.
+
+`--gui-api` is opt-in. It starts a loopback-only, read-only control adapter
+(`control.describe`, `control.status`, `control.config`) and shows **External control ·
+Read only** in the tab row. The API cannot connect, apply patterns or change settings.
+See [docs/gui-control-api.md](docs/gui-control-api.md).
+
+`--gui-api` は任意指定です。ループバック限定・読み取り専用の窓口を起動し、タブ行に
+**External control · Read only** を表示します。接続・パターン送信・設定変更はできません。
 
 ## Output safety rules (Windows backend)
 

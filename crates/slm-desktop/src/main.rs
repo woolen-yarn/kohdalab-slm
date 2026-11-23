@@ -8,8 +8,11 @@
 //!   output, steps through the list, saves a screenshot of this window, closes
 //! - `--demo-smoke <new-dir>`: headless demo vertical slice; writes evidence
 //!   into a new directory and exits non-zero on any failed check
+//! - `--gui-api` (with no arguments, `--config <path>` or `--demo`): also start
+//!   the read-only loopback control adapter; see `docs/gui-control-api.md`
 
 mod app;
+mod control_api;
 #[cfg(test)]
 mod gui_tests;
 
@@ -73,14 +76,27 @@ fn run_gui_sized(options: app::AppOptions, size: [f32; 2], view: &str) -> Result
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--gui-api` is opt-in and only combines with the interactive launches.
+    let gui_api = args.iter().any(|a| a == "--gui-api");
+    args.retain(|a| a != "--gui-api");
+    let interactive = match args.as_slice() {
+        [] => true,
+        [flag] => flag == "--demo" || flag == "--demo-wavelength",
+        [flag, _] => flag == "--config",
+        _ => false,
+    };
     let result = match args.as_slice() {
+        _ if gui_api && !interactive => {
+            Err("--gui-api combines only with no arguments, --config <path> or --demo".into())
+        }
         [] => match slm_device::config::default_config_path() {
             Some(config_path) => run_gui(app::AppOptions {
                 config_path,
                 demo: false,
                 tempdir: None,
                 capture: None,
+                gui_api,
             }),
             None => Err("Cannot find the home directory for ~/.kohdalab/slm".into()),
         },
@@ -89,6 +105,7 @@ fn main() {
             demo: false,
             tempdir: None,
             capture: None,
+            gui_api,
         }),
         [flag] if flag == "--demo" || flag == "--demo-wavelength" => tempfile::tempdir()
             .map_err(|e| format!("Create demo config directory: {e}"))
@@ -98,6 +115,7 @@ fn main() {
                     demo: true,
                     tempdir: Some(dir),
                     capture: None,
+                    gui_api,
                 }, [1566., 900.], if flag == "--demo-wavelength" { "wavelength" } else { "" })
             }),
         [flag, png, rest @ ..] if flag == "--demo-capture" && rest.len() != 1 => {
@@ -120,6 +138,7 @@ fn main() {
                                 demo: true,
                                 tempdir: Some(dir),
                                 capture: Some(PathBuf::from(png)),
+                                gui_api: false,
                             },
                             size,
                             &view,
@@ -135,7 +154,7 @@ fn main() {
             }
         }
         [flag, dir] if flag == "--demo-smoke" => smoke::run(&PathBuf::from(dir)),
-        _ => Err("Usage: kohdalab-slm [--demo | --config <path> | --demo-capture <png> [w h] | --demo-smoke <new-dir>]".into()),
+        _ => Err("Usage: kohdalab-slm [--gui-api] [--demo | --config <path>] | --demo-capture <png> [w h] | --demo-smoke <new-dir>".into()),
     };
     if let Err(e) = result {
         eprintln!("{e}");

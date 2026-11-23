@@ -23,6 +23,7 @@ fn harness(demo: bool) -> Harness<'static, App> {
                     demo,
                     tempdir: Some(dir),
                     capture: None,
+                    gui_api: false,
                 },
             )
         })
@@ -530,4 +531,123 @@ fn startup_fit_folds_panels_and_caps_the_minimum() {
     h.run_steps(2);
     assert!(!h.state().left_collapsed && h.state().right_collapsed);
     h.get_by_label("Connect");
+}
+
+/// Sends one request on a background thread while the GUI keeps stepping,
+/// as a real client would; returns the single JSON Lines reply.
+fn query(h: &mut Harness<'static, App>, body: serde_json::Value) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    let descriptor: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&h.state().control_api.as_ref().unwrap().descriptor).unwrap(),
+    )
+    .unwrap();
+    let mut body = body;
+    body["token"] = descriptor["token"].clone();
+    let port = descriptor["port"].as_u64().unwrap() as u16;
+    let client = std::thread::spawn(move || {
+        let mut stream =
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(stream, "{body}").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client.is_finished() {
+        assert!(Instant::now() < deadline, "no reply");
+        h.run_steps(1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    client.join().unwrap()
+}
+
+/// Tests inject a server in a temporary run directory, never `~/.kohdalab`.
+fn with_gui_api(h: &mut Harness<'static, App>, dir: &std::path::Path) {
+    let ctx = h.ctx.clone();
+    h.state_mut().control_api = Some(
+        crate::control_api::Server::start(Some(dir.into()), move || ctx.request_repaint()).unwrap(),
+    );
+    h.run_steps(1);
+}
+
+#[test]
+fn standalone_launch_has_no_external_control() {
+    let mut h = harness(true);
+    h.run_steps(2);
+    assert!(h.state().control_api.is_none());
+    assert!(h.query_by_label(crate::app::EXTERNAL_CONTROL).is_none());
+}
+
+#[test]
+fn read_only_api_observes_demo_state_and_never_drives_the_device() {
+    use serde_json::json;
+    let run = tempfile::tempdir().unwrap();
+    let mut h = harness(true);
+    until(&mut h, "display list", |a| !a.displays.is_empty());
+    with_gui_api(&mut h, run.path());
+    // Restrained indicator, and no take-control / stop affordance.
+    h.get_by_label(crate::app::EXTERNAL_CONTROL);
+    assert!(h.query_by_label("Take control").is_none());
+
+    let status = query(
+        &mut h,
+        json!({"control_protocol":1,"method":"control.status","request_id":"s1"}),
+    );
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["request_id"], "s1");
+    assert_eq!(status["result"]["phase"], "disconnected");
+    assert_eq!(status["result"]["native"]["demo"], true);
+    assert_eq!(status["result"]["native"]["simulated"], true);
+    assert_eq!(status["result"]["ownership"]["owned"], false);
+
+    // Write-shaped requests are refused and change nothing.
+    for method in [
+        "control.connect",
+        "control.apply",
+        "control.acquire",
+        "control.stop",
+    ] {
+        let r = query(&mut h, json!({"control_protocol":1,"method":method}));
+        assert_eq!(r["error"]["code"], "unsupported", "{method}");
+    }
+    h.run_steps(3);
+    assert!(matches!(h.state().device_state, DeviceState::Disconnected));
+    assert_eq!(shows(&h), 0, "the API never shows a frame");
+
+    let config = query(
+        &mut h,
+        json!({"control_protocol":1,"method":"control.config"}),
+    );
+    assert_eq!(config["result"]["source"], "temporary_demo");
+    assert_eq!(config["result"]["output"]["backend"], "demo");
+    assert!(!config.to_string().contains("config.json"));
+
+    // The GUI keeps full control; status follows what the GUI did.
+    h.get_by_label("Connect").click();
+    until(&mut h, "connected", |a| a.connected());
+    let status = query(
+        &mut h,
+        json!({"control_protocol":1,"method":"control.status"}),
+    );
+    assert_eq!(status["result"]["phase"], "ready");
+    assert_eq!(status["result"]["native"]["device"], "connected");
+    assert_eq!(
+        status["result"]["native"]["showing"]["receipt"]["verification"],
+        "Simulated"
+    );
+    assert_eq!(
+        shows(&h),
+        1,
+        "only the GUI's own connect showed the reset frame"
+    );
+
+    let descriptor = h.state().control_api.as_ref().unwrap().descriptor.clone();
+    drop(h);
+    assert!(
+        !descriptor.exists(),
+        "descriptor removed when the app closes"
+    );
 }

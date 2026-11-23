@@ -1570,18 +1570,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kohdalab-control-protocol"
+version = "1.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "kohdalab-slm"
 version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_kittest",
  "image",
+ "kohdalab-control-protocol",
  "rfd",
  "serde",
  "serde_json",
  "slm-core",
  "slm-device",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
