@@ -226,9 +226,14 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>, String> {
                 ),
                 ..Default::default()
             };
-            // SAFETY: as above. Bit 1 of the flags union is advancedColorEnabled.
-            let advanced_color = (unsafe { DisplayConfigGetDeviceInfo(&mut color.header) } == 0)
-                .then(|| unsafe { color.Anonymous.value } & 0x2 != 0);
+            // SAFETY: as above.
+            let advanced_color = if unsafe { DisplayConfigGetDeviceInfo(&mut color.header) } == 0 {
+                // SAFETY: the call succeeded, so the flags union is initialized;
+                // bit 1 is advancedColorEnabled.
+                Some(unsafe { color.Anonymous.value } & 0x2 != 0)
+            } else {
+                None
+            };
 
             // SAFETY: without QDC_VIRTUAL_MODE_AWARE the union holds modeInfoIdx.
             let source_index = unsafe { source.Anonymous.modeInfoIdx } as usize;
@@ -508,8 +513,10 @@ fn readback(shared: &Shared) -> Result<(), String> {
                 let mut first = None;
                 let mut count = 0usize;
                 for (i, (a, b)) in captured
-                    .chunks_exact(4)
-                    .zip(expected.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(expected.as_chunks::<4>().0.iter())
                     .enumerate()
                 {
                     if a[..3] != b[..3] {
