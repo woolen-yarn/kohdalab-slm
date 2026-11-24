@@ -32,9 +32,7 @@ jobs:
           python-version: '3.13'
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgl1-mesa-dev libegl1-mesa libgl1-mesa-dri libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev xvfb xauth
+        uses: ./.github/actions/linux-gui-deps
       - name: Locate Windows resource compiler
         if: runner.os == 'Windows'
         shell: pwsh

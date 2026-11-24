@@ -21,12 +21,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, windows-2025]
+        # ubuntu-22.04 is the oldest Linux the DEB/tar.gz packages support.
+        os: [ubuntu-22.04, macos-15, windows-2025]
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
         with:
           persist-credentials: false
+      # Same packages as the Linux job in package.yml.
+      - name: Linux GUI dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-gui-deps
       - name: Locate Windows resource compiler
         if: runner.os == 'Windows'
         shell: pwsh
@@ -38,9 +43,78 @@ jobs:
           "RC=$($rc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Check formatting
         run: cargo fmt --all --check
+      # Per OS, so cfg(windows) backend code is linted too. Default lint set;
+      # warnings fail the job.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test workspace
+        if: runner.os != 'Linux'
         run: cargo test --locked --workspace
+      # Software-rendered X server, as the Linux package smoke test uses.
+      - name: Test workspace (Xvfb, software GL)
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: xvfb-run -a -s '-screen 0 1920x1080x24 +extension GLX' cargo test --locked --workspace
       # Standard library only (Python >= 3.10 on the runner image); no install.
       - name: Test Python control SDK
         working-directory: bindings/control
         run: ${{ runner.os == 'Windows' && 'python' || 'python3' }} -m unittest -v test_control
+
+  # Builds the locked dependency graph with the declared rust-version
+  # (workspace Cargo.toml) instead of the pinned rust-toolchain.toml release.
+  # Windows is included because the output backend is cfg(windows).
+  msrv:
+    name: MSRV (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2025]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Linux GUI dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-gui-deps
+      - name: Locate Windows resource compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter rc.exe |
+            Where-Object { $_.FullName -match '\\x64\\rc.exe$' } |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $rc) { throw 'Windows resource compiler rc.exe was not found.' }
+          "RC=$($rc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Check with the declared rust-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^rust-version = "\([0-9.]*\)"\r\{0,1\}$/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then echo 'rust-version not found in Cargo.toml' >&2; exit 1; fi
+          echo "Declared rust-version: $msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check --locked --workspace --all-targets
+
+  docs:
+    name: Markdown links (offline)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+          # Release links are checked against the repository's tags.
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Test the link checker
+        working-directory: scripts
+        run: python -m unittest -v test_check_docs_links
+      - name: Check README and docs links
+        run: python scripts/check_docs_links.py --require-tags

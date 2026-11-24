@@ -73,8 +73,13 @@ selected preview source (**First value** or **List row**). The **Save target** l
 
 ```sh
 cargo test --workspace --locked
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo build --release --locked
+python3 scripts/check_docs_links.py   # offline Markdown link check (Python 3.11+)
 ```
+
+`rust-toolchain.toml` pins the release toolchain; CI also checks the declared minimum
+`rust-version` from `Cargo.toml` with `cargo +<rust-version> check --locked --workspace --all-targets`.
 
 On Windows, `crates/slm-desktop/build.rs` embeds `assets/icon.ico` and version info into the EXE with `rc.exe` (MSVC; override with `RC`) or `windres` (GNU; override with `WINDRES`). Other platforms need no resource compiler; the window icon comes from `assets/icon.png`.
 

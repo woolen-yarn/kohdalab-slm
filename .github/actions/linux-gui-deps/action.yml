@@ -1,0 +1,12 @@
+name: Linux GUI dependencies
+description: >-
+  Mesa/EGL, xkbcommon, Wayland headers and Xvfb for building and running the
+  eframe (glow, x11, wayland) GUI on Ubuntu runners. Shared by the Test and
+  Package workflows so both use the same packages.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-dev libegl1-mesa libgl1-mesa-dri libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev xvfb xauth
