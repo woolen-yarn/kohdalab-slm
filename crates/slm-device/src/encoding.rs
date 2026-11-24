@@ -54,13 +54,33 @@ impl InputMode {
     }
 }
 
-/// `(r, g, b)` for one 60 Hz pixel (Table 6).
-pub fn pack60(code: u16) -> [u8; 3] {
-    [
+/// Largest code the 60 Hz Table 6 layout can carry (10 bit).
+pub const MAX_CODE_60HZ: u16 = 1023;
+
+/// `(r, g, b)` for one 60 Hz pixel (Table 6), or `None` if `code` exceeds
+/// [`MAX_CODE_60HZ`]. Without the check, bit 10 and above would be truncated
+/// by the `u8` red channel and a different, valid-looking code would be sent.
+pub fn try_pack60(code: u16) -> Option<[u8; 3]> {
+    if code > MAX_CODE_60HZ {
+        return None;
+    }
+    Some([
         ((code >> 7) << 5) as u8,
         (((code >> 4) & 7) << 5) as u8,
         ((code & 15) << 4) as u8,
-    ]
+    ])
+}
+
+/// `(r, g, b)` for one 60 Hz pixel (Table 6).
+///
+/// # Panics
+/// If `code > MAX_CODE_60HZ`; such a code has no Table 6 representation. Use
+/// [`try_pack60`] for unchecked input, or [`encode_bgrx`], which validates
+/// every code and reports its position.
+pub fn pack60(code: u16) -> [u8; 3] {
+    try_pack60(code).unwrap_or_else(|| {
+        panic!("Code {code} is outside the 60 Hz Table 6 range 0–{MAX_CODE_60HZ}")
+    })
 }
 
 /// Inverse of [`pack60`]; `None` if any bit outside the Table 6 layout is set.
@@ -76,7 +96,7 @@ pub fn encode_bgrx(frame: &CodeFrame, mode: InputMode, max_code: u16) -> Result<
     if let Some(reason) = mode.unsupported_reason() {
         return Err(reason.into());
     }
-    if max_code > 1023 {
+    if max_code > MAX_CODE_60HZ {
         return Err("Only 10-bit codes can be packed into RGB".into());
     }
     let mut out = Vec::with_capacity(frame.data.len() * 4);
@@ -102,20 +122,17 @@ pub fn decode_bgrx(
     if let Some(reason) = mode.unsupported_reason() {
         return Err(reason.into());
     }
-    if buffer.len() != width as usize * height as usize * 4 {
+    let pixels = slm_core::frame::validate_raster(width, height)?;
+    if buffer.len() != pixels * 4 {
         return Err("Encoded buffer size does not match the raster".into());
     }
-    let mut data = Vec::with_capacity(buffer.len() / 4);
+    let mut data = Vec::with_capacity(pixels);
     for px in buffer.as_chunks::<4>().0 {
         data.push(
             unpack60([px[2], px[1], px[0]]).ok_or("Pixel has bits outside the Table 6 layout")?,
         );
     }
-    Ok(CodeFrame {
-        width,
-        height,
-        data,
-    })
+    CodeFrame::new(width, height, data)
 }
 
 #[cfg(test)]
@@ -133,6 +150,28 @@ mod tests {
             assert_eq!(unpack60(pack60(code)), Some(code));
         }
         assert_eq!(unpack60([1, 0, 0]), None);
+    }
+
+    #[test]
+    fn pack60_precondition_is_enforced() {
+        assert_eq!(try_pack60(MAX_CODE_60HZ), Some([224, 224, 240]));
+        // 1024 would otherwise wrap to the packing of code 0.
+        assert_eq!(try_pack60(MAX_CODE_60HZ + 1), None);
+        assert_eq!(try_pack60(u16::MAX), None);
+        assert!(std::panic::catch_unwind(|| pack60(1024)).is_err());
+        // encode_bgrx reports the offending pixel instead of panicking, even
+        // when the caller's max_code would otherwise admit the code.
+        let frame = CodeFrame::new(2, 1, vec![5, 1024]).unwrap();
+        let error = encode_bgrx(&frame, InputMode::Hz60, 1023).unwrap_err();
+        assert!(error.contains("(1, 0)"), "{error}");
+        assert!(encode_bgrx(&frame, InputMode::Hz60, 1024).is_err());
+    }
+
+    #[test]
+    fn decode_refuses_out_of_bounds_raster() {
+        assert!(decode_bgrx(&[], 0, 0, InputMode::Hz60).is_err());
+        let error = decode_bgrx(&[], u32::MAX, u32::MAX, InputMode::Hz60).unwrap_err();
+        assert!(error.contains("limit"), "{error}");
     }
 
     #[test]

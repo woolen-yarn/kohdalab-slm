@@ -67,6 +67,10 @@ pub fn read_santec_csv(
     height: u32,
     max_code: u16,
 ) -> Result<CodeFrame, CsvError> {
+    // The expected size usually comes from a config or experiment file; check
+    // it before anything is allocated. Reported at line 1 / column 1 because
+    // the problem is the requested raster, not a particular field.
+    let pixels = crate::frame::validate_raster(width, height).map_err(|e| err(1, 1, e))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text
         .lines()
@@ -112,7 +116,7 @@ pub fn read_santec_csv(
             ),
         ));
     }
-    let mut data = Vec::with_capacity(width as usize * height as usize);
+    let mut data = Vec::with_capacity(pixels);
     let mut rows = 0u32;
     for (index, line) in lines {
         let line_no = index + 1;
@@ -250,5 +254,23 @@ mod tests {
         // pandas float formatting of integral values is accepted.
         assert!(read_santec_csv("Y/X,0,1\n0,1.0,2\n", 2, 1, 1023).is_ok());
         assert!(read_santec_csv("Y/X,0,1\n0,1.5,2\n", 2, 1, 1023).is_err());
+    }
+
+    #[test]
+    fn requested_raster_is_bounded_before_allocation() {
+        // A matching header with an absurd height must not reserve
+        // width × height codes up front.
+        let e = read_santec_csv("Y/X,0,1\n0,1,2\n", 2, u32::MAX, 1023).unwrap_err();
+        assert_eq!((e.line, e.column), (1, 1));
+        assert!(e.message.contains("limit"), "{}", e.message);
+        let e = read_santec_csv("Y/X\n", 0, 1, 1023).unwrap_err();
+        assert!(e.message.contains("positive"), "{}", e.message);
+        // The largest permitted side still parses.
+        let side = crate::frame::MAX_RASTER_DIMENSION;
+        let frame = CodeFrame::uniform(side, 1, 3);
+        assert_eq!(
+            read_santec_csv(&write_santec_csv(&frame), side, 1, 1023).unwrap(),
+            frame
+        );
     }
 }

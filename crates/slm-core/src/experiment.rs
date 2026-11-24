@@ -632,6 +632,17 @@ mod tests {
             );
             assert!(ExperimentDoc::load(&path).is_err(), "accepted {bad}");
         }
+        // An out-of-bounds raster in the file is refused at load time, before
+        // any CSV is read or frame allocated.
+        for (w, h) in [(0, 4), (u32::MAX, 4), (4097, 4096)] {
+            let mut value: serde_json::Value = serde_json::from_str(&good).unwrap();
+            let raster = &mut value["items"][0]["profile"]["raster"];
+            raster["width"] = w.into();
+            raster["height"] = h.into();
+            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+            let e = ExperimentDoc::load(&path).unwrap_err();
+            assert!(e.contains("Raster"), "{w}×{h}: {e}");
+        }
         reset();
         // summary never slices inside a character.
         let mut item = doc.experiment.items[0].clone();

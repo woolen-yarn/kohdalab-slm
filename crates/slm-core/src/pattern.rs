@@ -22,6 +22,14 @@ pub struct Raster {
     pub height: u32,
 }
 
+impl Raster {
+    /// Positive and within the documented bounds
+    /// ([`crate::frame::validate_raster`]); returns the pixel count.
+    pub fn validate(&self) -> Result<usize, String> {
+        crate::frame::validate_raster(self.width, self.height)
+    }
+}
+
 /// Generator-side phase→code calibration (notebook compatibility mode).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PhaseCalibration {
@@ -50,9 +58,7 @@ pub struct GenerationProfile {
 
 impl GenerationProfile {
     pub fn validate(&self) -> Result<(), String> {
-        if self.raster.width == 0 || self.raster.height == 0 {
-            return Err("Raster size must be positive".into());
-        }
+        self.raster.validate()?;
         self.optics.validate()?;
         if self.calibration.code_period == 0 {
             return Err("Code period must be at least 1".into());
@@ -506,6 +512,30 @@ mod tests {
         assert!(r.phase().is_none());
         assert_eq!(r.code().uniform_code(), Some(1023));
         assert!(PatternSpec::Uniform { code: 1024 }.render(&p).is_err());
+    }
+
+    #[test]
+    fn generation_refuses_out_of_bounds_raster_before_allocating() {
+        use crate::frame::MAX_RASTER_DIMENSION;
+        assert!(profile(1920, 1200).validate().is_ok());
+        let single = PatternSpec::SingleWave {
+            wave: wave(10., Waveform::Ramp),
+            geometry: geometry(0.),
+        };
+        for (w, h) in [
+            (0, 1200),
+            (MAX_RASTER_DIMENSION + 1, 1),
+            (4097, 4096),
+            (u32::MAX, u32::MAX),
+        ] {
+            let p = profile(w, h);
+            assert!(p.validate().is_err(), "{w}×{h}");
+            assert!(PatternSpec::Uniform { code: 0 }.render(&p).is_err());
+            assert!(single.render(&p).is_err());
+        }
+        // Largest single side generates normally.
+        let r = single.render(&profile(MAX_RASTER_DIMENSION, 1)).unwrap();
+        assert_eq!(r.code().data.len(), MAX_RASTER_DIMENSION as usize);
     }
 
     #[test]
