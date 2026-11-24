@@ -14,9 +14,9 @@
 
 use sha2::{Digest, Sha256};
 
-/// Largest accepted raster width or height [px].
+/// Largest accepted raster width or height, in pixels.
 pub const MAX_RASTER_DIMENSION: u32 = 8192;
-/// Largest accepted raster area [px] (16 Mpx, e.g. 4096 × 4096).
+/// Largest accepted raster area, in pixels (16 Mpx, e.g. 4096 × 4096).
 pub const MAX_RASTER_PIXELS: u64 = 1 << 24;
 
 /// Check a raster size against the documented bounds and return its pixel
